@@ -10,7 +10,7 @@ license: MIT
 requirements: aiofiles,pathspec,pydantic
 """
 
-from typing import Optional, Callable, Awaitable, Any, List, Dict, Union
+from typing import Optional, Callable, Awaitable, Any, List, Dict, Union, Literal, Tuple
 from pydantic import BaseModel, Field
 import asyncio
 import aiofiles
@@ -27,6 +27,7 @@ from urllib.parse import urlparse
 from pathlib import Path
 import shlex
 import time
+import hashlib
 
 class Tools:
     """
@@ -133,6 +134,11 @@ class Tools:
             default="qwen",
             description="Choix du LLM CLI pour l'analyse (qwen, gemini, ou auto)"
         )
+        analysis_mode: Literal["smart", "full", "diff"] = Field(
+            default="smart",
+            description="Mode d'analyse (smart, full, diff)",
+        )
+
         
         enable_auto_analysis: bool = Field(
             default=True,
@@ -177,6 +183,23 @@ class Tools:
         llm_cmd_template: str = Field(
             default="{bin} --model {model} --prompt {prompt}",
             description="Gabarit de commande pour l'appel LLM CLI"
+        )
+
+        prompt_style: str = Field(
+            default="concise, structured, actionable",
+            description="Style de rédaction des synthèses",
+        )
+        prompt_extra_architecture: str = Field(
+            default="",
+            description="Instructions additionnelles pour l'analyse d'architecture",
+        )
+        prompt_extra_api: str = Field(
+            default="",
+            description="Instructions additionnelles pour la synthèse API",
+        )
+        prompt_extra_codemap: str = Field(
+            default="",
+            description="Instructions additionnelles pour la carte du code",
         )
 
     def __init__(self):
@@ -327,23 +350,64 @@ class Tools:
             
             # 3. Scan des fichiers selon les patterns
             file_stats = await self._scan_repository_files(local_path)
-            self.logger.info(f"Fichiers scannés: {file_stats['total_files']} fichiers, {file_stats['total_size_mb']:.1f} MB")
-            
-            # 4. Analyse LLM CLI si activée
-            synthesis_files = []
-            if self.user_valves.enable_auto_analysis:
+            self.logger.info(
+                f"Fichiers scannés: {file_stats['total_files']} fichiers, {file_stats['total_size_mb']:.1f} MB"
+            )
+
+            should_reanalyze, prev_meta = await self._should_reanalyze(
+                local_path, file_stats["files"], self.user_valves.analysis_mode
+            )
+
+            analysis_dir = os.path.join(local_path, "docs_analysis")
+            os.makedirs(analysis_dir, exist_ok=True)
+
+            synthesis_files: List[str] = []
+            llm_info: Dict[str, str] = prev_meta.get("llm", {}) if prev_meta else {}
+            synth_count = prev_meta.get("synthesis_count", 0) if prev_meta else 0
+
+            if self.user_valves.enable_auto_analysis and should_reanalyze:
                 if __event_emitter__:
                     await __event_emitter__({
                         "type": "status",
                         "data": {
                             "description": f"🤖 Analyse par {self.user_valves.llm_cli_choice.upper()}...",
                             "done": False,
-                            "hidden": False
-                        }
+                            "hidden": False,
+                        },
                     })
-                
-                synthesis_files = await self._run_llm_analysis(local_path, repo_info, __event_emitter__)
-            
+                synthesis_files, llm_info = await self._run_llm_analysis(
+                    local_path, repo_info, file_stats, prev_meta, __event_emitter__
+                )
+                synth_count = len(synthesis_files)
+            elif not should_reanalyze:
+                self.logger.info(
+                    "Aucun changement détecté, réutilisation des synthèses existantes"
+                )
+                if __event_emitter__:
+                    await __event_emitter__({
+                        "type": "status",
+                        "data": {
+                            "description": "⚡ Aucun changement détecté, réutilisation des synthèses existantes",
+                            "done": False,
+                            "hidden": False,
+                        },
+                    })
+                existing = [
+                    f
+                    for f in ["ARCHITECTURE.md", "API_SUMMARY.md", "CODE_MAP.md"]
+                    if os.path.exists(os.path.join(analysis_dir, f))
+                ]
+                synthesis_files = existing
+
+            await self._save_analysis_metadata(
+                local_path,
+                repo_info,
+                file_stats,
+                llm_info,
+                synth_count,
+                prev_meta if not should_reanalyze else None,
+            )
+
             # 5. Injection du contexte
             if __event_emitter__:
                 await __event_emitter__({
@@ -354,8 +418,10 @@ class Tools:
                         "hidden": False
                     }
                 })
-            
-            context_content = await self._inject_repository_context(local_path, repo_info, synthesis_files, __event_emitter__)
+
+            context_content = await self._inject_repository_context(
+                local_path, repo_info, synthesis_files, __event_emitter__
+            )
             
             # 6. Finalisation
             if __event_emitter__:
@@ -369,6 +435,14 @@ class Tools:
                 })
             
             # Préparation du résumé final
+            llm_used = (
+                f"{llm_info.get('cli_name', 'N/A').upper()} ({llm_info.get('model', '')})"
+                if llm_info
+                else "N/A"
+            )
+            synth_display = (
+                "0 (réutilisées)" if not should_reanalyze else str(len(synthesis_files))
+            )
             summary = f"""
 ## 📊 Analyse du dépôt {repo_info['owner']}/{repo_info['repo']} terminée
 
@@ -376,8 +450,8 @@ class Tools:
 - 📁 Fichiers analysés : {file_stats['total_files']}
 - 📦 Taille totale : {file_stats['total_size_mb']:.1f} MB
 - 🗂️ Types de fichiers : {', '.join(file_stats['file_types'][:5])}
-- 🤖 LLM utilisé : {self.user_valves.llm_cli_choice.upper()}
-- 📋 Synthèses générées : {len(synthesis_files)}
+- 🤖 LLM utilisé : {llm_used}
+- 📋 Synthèses générées : {synth_display}
 
 Le contexte du dépôt a été injecté et est maintenant disponible pour vos questions !
 """
@@ -439,43 +513,51 @@ Le contexte du dépôt a été injecté et est maintenant disponible pour vos qu
             if not os.path.exists(repo_path):
                 raise ValueError(f"Dépôt {repo_name} non trouvé localement")
             
-            # Git pull
-            result = await self._run_git_command(repo_path, ["pull", "origin"], __event_emitter__)
-            
-            # Vérification des changements
-            has_changes = "Already up to date" not in result
-            
-            if has_changes and self.user_valves.enable_auto_analysis:
-                # Relancer l'analyse
-                synthesis_files = await self._run_llm_analysis(
-                    repo_path, 
-                    {"owner": repo_name.split("_")[0], "repo": "_".join(repo_name.split("_")[1:])},
-                    __event_emitter__
+            await self._run_git_command(repo_path, ["pull", "origin"], __event_emitter__)
+
+            file_stats = await self._scan_repository_files(repo_path)
+            should_reanalyze, prev_meta = await self._should_reanalyze(
+                repo_path, file_stats["files"], self.user_valves.analysis_mode
+            )
+
+            repo_info = {
+                "owner": repo_name.split("_")[0],
+                "repo": "_".join(repo_name.split("_")[1:]),
+            }
+
+            llm_info = prev_meta.get("llm", {}) if prev_meta else {}
+            synth_count = prev_meta.get("synthesis_count", 0) if prev_meta else 0
+            synthesis_files: List[str] = []
+
+            if self.user_valves.enable_auto_analysis and should_reanalyze:
+                synthesis_files, llm_info = await self._run_llm_analysis(
+                    repo_path, repo_info, file_stats, prev_meta, __event_emitter__
                 )
-                
-                if __event_emitter__:
-                    await __event_emitter__({
-                        "type": "status",
-                        "data": {
-                            "description": "✅ Synchronisation et analyse terminées !",
-                            "done": True,
-                            "hidden": False
-                        }
-                    })
-                
-                return f"✅ Dépôt {repo_name} synchronisé et ré-analysé ({len(synthesis_files)} synthèses mises à jour)"
+                synth_count = len(synthesis_files)
+                msg = f"✅ Dépôt {repo_name} synchronisé et ré-analysé ({len(synthesis_files)} synthèses mises à jour)"
             else:
-                if __event_emitter__:
-                    await __event_emitter__({
-                        "type": "status",
-                        "data": {
-                            "description": "✅ Synchronisation terminée (aucun changement)",
-                            "done": True,
-                            "hidden": False
-                        }
-                    })
-                
-                return f"✅ Dépôt {repo_name} déjà à jour"
+                msg = f"✅ Dépôt {repo_name} déjà à jour"
+
+            await self._save_analysis_metadata(
+                repo_path,
+                repo_info,
+                file_stats,
+                llm_info,
+                synth_count,
+                prev_meta if not should_reanalyze else None,
+            )
+
+            if __event_emitter__:
+                await __event_emitter__({
+                    "type": "status",
+                    "data": {
+                        "description": msg,
+                        "done": True,
+                        "hidden": False,
+                    },
+                })
+
+            return msg
                 
         except Exception as e:
             error_msg = f"❌ Erreur synchronisation {repo_name}: {str(e)}"
@@ -803,6 +885,60 @@ Le contexte du dépôt a été injecté et est maintenant disponible pour vos qu
         except Exception as e:
             raise RuntimeError(f"Erreur exécution Git: {str(e)}")
 
+    async def _git_head(self, repo_path: str) -> str:
+        out = await self._run_git_command(repo_path, ["rev-parse", "HEAD"])
+        return out.strip()
+
+    def _compute_file_sha256(self, abs_path: str, cap_bytes: int) -> str:
+        h = hashlib.sha256()
+        with open(abs_path, "rb") as f:
+            h.update(f.read(cap_bytes))
+        return h.hexdigest()
+
+    async def _load_metadata(self, repo_path: str) -> Optional[dict]:
+        meta_path = os.path.join(repo_path, "docs_analysis", "analysis_metadata.json")
+        if not os.path.exists(meta_path):
+            return None
+        try:
+            async with aiofiles.open(meta_path, "r", encoding="utf-8") as f:
+                return json.loads(await f.read())
+        except Exception:
+            return None
+
+    async def _should_reanalyze(
+        self,
+        repo_path: str,
+        scanned_files: List[Dict[str, Any]],
+        mode: str,
+    ) -> Tuple[bool, dict]:
+        """Détermine si une ré-analyse est nécessaire."""
+        if mode == "full":
+            prev = await self._load_metadata(repo_path)
+            return True, prev or {}
+
+        prev = await self._load_metadata(repo_path)
+        if not prev:
+            return True, {}
+        try:
+            current_head = await self._git_head(repo_path)
+        except Exception:
+            return True, prev
+        if prev.get("repo_head_commit") and prev["repo_head_commit"] != current_head:
+            return True, prev
+        if mode in ("smart", "diff"):
+            cap = self.valves.max_bytes_per_file
+            prev_map = {f["path"]: f.get("sha256") for f in prev.get("files", [])}
+            for f in scanned_files:
+                abs_p = os.path.join(repo_path, f["path"])
+                try:
+                    cur_sha = self._compute_file_sha256(abs_p, cap)
+                except Exception:
+                    return True, prev
+                if prev_map.get(f["path"]) != cur_sha:
+                    return True, prev
+            return False, prev
+        return True, prev
+
     async def _scan_repository_files(self, repo_path: str) -> Dict[str, Any]:
         """
         Scan les fichiers du dépôt selon les patterns configurés
@@ -818,14 +954,14 @@ Le contexte du dépôt a été injecté et est maintenant disponible pour vos qu
             
             # Détermination des patterns à utiliser
             include_patterns = (
-                self.user_valves.custom_globs_include 
-                if self.user_valves.custom_globs_include 
+                self.user_valves.custom_globs_include
+                if self.user_valves.custom_globs_include
                 else self.valves.default_globs_include
             ).split(',')
-            
+
             exclude_patterns = (
-                self.user_valves.custom_globs_exclude 
-                if self.user_valves.custom_globs_exclude 
+                self.user_valves.custom_globs_exclude
+                if self.user_valves.custom_globs_exclude
                 else self.valves.default_globs_exclude
             ).split(',')
             
@@ -839,8 +975,12 @@ Le contexte du dépôt a été injecté et est maintenant disponible pour vos qu
             
             # Parcours récursif
             for root, dirs, files in os.walk(repo_path):
-                # Filtrage des dossiers exclus
-                dirs[:] = [d for d in dirs if not exclude_spec.match_file(os.path.join(root, d))]
+                # Filtrage des dossiers exclus (chemins relatifs)
+                dirs[:] = [
+                    d
+                    for d in dirs
+                    if not exclude_spec.match_file(os.path.relpath(os.path.join(root, d), repo_path))
+                ]
                 
                 for file in files:
                     file_path = os.path.join(root, file)
@@ -874,7 +1014,9 @@ Le contexte du dépôt a été injecté et est maintenant disponible pour vos qu
                 "total_size_bytes": total_size,
                 "total_size_mb": total_size / (1024 * 1024),
                 "file_types": sorted(list(file_types)),
-                "files": files_found
+                "files": files_found,
+                "include_patterns": include_patterns,
+                "exclude_patterns": exclude_patterns,
             }
             
             self.logger.info(f"Scan terminé: {stats['total_files']} fichiers, {stats['total_size_mb']:.1f} MB")
@@ -885,52 +1027,47 @@ Le contexte du dépôt a été injecté et est maintenant disponible pour vos qu
             raise RuntimeError(f"Échec scan fichiers: {str(e)}")
 
     async def _run_llm_analysis(
-        self, 
-        repo_path: str, 
+        self,
+        repo_path: str,
         repo_info: Dict[str, str],
-        __event_emitter__: Optional[Callable[[dict], Awaitable[None]]] = None
-    ) -> List[str]:
-        """
-        Lance l'analyse via LLM CLI externe
-        
-        Prépare les prompts, exécute le LLM CLI, et sauvegarde les résultats
-        dans des fichiers de synthèse structurés.
-        
-        Args:
-            repo_path (str): Chemin du dépôt local
-            repo_info (Dict): Informations du dépôt
-            __event_emitter__: Fonction d'émission d'événements
-            
-        Returns:
-            List des fichiers de synthèse générés
-        """
+        file_stats: Dict[str, Any],
+        prev_metadata: Optional[dict],
+        __event_emitter__: Optional[Callable[[dict], Awaitable[None]]] = None,
+    ) -> Tuple[List[str], Dict[str, str]]:
+        """Exécute l'analyse LLM et retourne les fichiers générés et info LLM."""
         try:
             self.logger.info(f"Analyse LLM du repo: {repo_path}")
-            
-            # Création du dossier d'analyse
+
             analysis_dir = os.path.join(repo_path, "docs_analysis")
             os.makedirs(analysis_dir, exist_ok=True)
-            
-            # Vérification de la disponibilité du LLM CLI
+
             llm_cli = await self._get_available_llm_cli()
-            
             if not llm_cli:
                 self.logger.warning("Aucun LLM CLI disponible, analyse ignorée")
-                return []
-            
-            # Préparation du contexte de code
-            code_context = await self._prepare_code_context(repo_path)
-            
-            # Génération des synthèses
+                return [], {}
+
+            bin_name = (
+                self.user_valves.llm_bin_name
+                if llm_cli == self.user_valves.llm_cli_choice.lower()
+                else llm_cli
+            )
+            bin_path = self._resolve_executable(bin_name)
+            if not bin_path:
+                self.logger.error(f"Binaire LLM introuvable: {bin_name}")
+                return [], {}
+
+            code_context = await self._prepare_code_context(
+                repo_path, file_stats, prev_metadata
+            )
+
             synthesis_files = []
             lang = self.user_valves.preferred_language
-            
             analyses_to_run = [
                 ("ARCHITECTURE.md", "architecture"),
                 ("API_SUMMARY.md", "api"),
-                ("CODE_MAP.md", "codemap")
+                ("CODE_MAP.md", "codemap"),
             ]
-            
+
             for filename, analysis_type in analyses_to_run:
                 if __event_emitter__:
                     await __event_emitter__({
@@ -938,37 +1075,45 @@ Le contexte du dépôt a été injecté et est maintenant disponible pour vos qu
                         "data": {
                             "description": f"🤖 Génération {filename}...",
                             "done": False,
-                            "hidden": False
-                        }
+                            "hidden": False,
+                        },
                     })
-                
                 try:
-                    prompt = self._analysis_prompts[analysis_type][lang]
-                    result = await self._execute_llm_cli(
-                        llm_cli, prompt, code_context, __event_emitter__
+                    base_prompt = self._analysis_prompts[analysis_type].get(
+                        lang, self._analysis_prompts[analysis_type]["en"]
                     )
-                    
+                    extra = getattr(
+                        self.user_valves, f"prompt_extra_{analysis_type}", ""
+                    )
+                    prompt = (
+                        f"{base_prompt}\n\nStyle: {self.user_valves.prompt_style}\n"
+                        f"Extra: {extra}\nLanguage: {lang}"
+                    )
+                    result = await self._execute_llm_cli(
+                        llm_cli, bin_path, prompt, code_context, __event_emitter__
+                    )
                     if result:
                         file_path = os.path.join(analysis_dir, filename)
-                        async with aiofiles.open(file_path, 'w', encoding='utf-8') as f:
+                        async with aiofiles.open(file_path, "w", encoding="utf-8") as f:
                             await f.write(result)
-                        
                         synthesis_files.append(filename)
                         self.logger.info(f"Synthèse générée: {filename}")
-                    
                 except Exception as e:
                     self.logger.error(f"Erreur génération {filename}: {e}")
                     continue
-            
-            # Sauvegarde des métadonnées
-            await self._save_analysis_metadata(analysis_dir, repo_info, llm_cli, len(synthesis_files))
-            
-            self.logger.info(f"Analyse LLM terminée: {len(synthesis_files)} synthèses générées")
-            return synthesis_files
-            
+
+            llm_info = {
+                "cli_name": llm_cli,
+                "bin_path": bin_path,
+                "model": self.user_valves.llm_model_name,
+            }
+            self.logger.info(
+                f"Analyse LLM terminée: {len(synthesis_files)} synthèses générées"
+            )
+            return synthesis_files, llm_info
         except Exception as e:
             self.logger.error(f"Erreur analyse LLM: {e}", exc_info=True)
-            return []
+            return [], {}
 
     async def _get_available_llm_cli(self) -> Optional[str]:
         """
@@ -1083,7 +1228,12 @@ Le contexte du dépôt a été injecté et est maintenant disponible pour vos qu
             # En cas de problème de regex, retourner le texte original
             return text
 
-    async def _prepare_code_context(self, repo_path: str) -> str:
+    async def _prepare_code_context(
+        self,
+        repo_path: str,
+        file_stats: Optional[Dict[str, Any]] = None,
+        prev_metadata: Optional[dict] = None,
+    ) -> str:
         """
         Prépare le contexte de code pour l'analyse LLM
         
@@ -1143,12 +1293,30 @@ Le contexte du dépôt a été injecté et est maintenant disponible pour vos qu
                     except Exception:
                         continue
 
-            # Scan des fichiers du projet selon la profondeur d'analyse
-            file_stats = await self._scan_repository_files(repo_path)
+            if file_stats is None:
+                file_stats = await self._scan_repository_files(repo_path)
 
             depth_limits = {"quick": 10, "standard": 25, "deep": 50}
             max_files = depth_limits.get(self.user_valves.analysis_depth, 25)
-            selected_files = file_stats["files"][:max_files]
+
+            files_list = file_stats["files"]
+            if (
+                self.user_valves.analysis_mode == "diff" and prev_metadata is not None
+            ):
+                prev_map = {f["path"]: f.get("sha256") for f in prev_metadata.get("files", [])}
+                changed = []
+                cap = self.valves.max_bytes_per_file
+                for f in files_list:
+                    abs_p = os.path.join(repo_path, f["path"])
+                    try:
+                        cur_sha = self._compute_file_sha256(abs_p, cap)
+                    except Exception:
+                        continue
+                    if prev_map.get(f["path"]) != cur_sha:
+                        changed.append(f)
+                files_list = changed
+
+            selected_files = files_list[:max_files]
 
             for file_info in selected_files:
                 file_path = os.path.join(repo_path, file_info["path"])
@@ -1173,30 +1341,31 @@ Le contexte du dépôt a été injecté et est maintenant disponible pour vos qu
     async def _execute_llm_cli(
         self,
         llm_cli: str,
+        bin_path: str,
         prompt: str,
         context: str,
         __event_emitter__: Optional[Callable[[dict], Awaitable[None]]] = None,
     ) -> Optional[str]:
         """Exécute le LLM CLI avec le prompt et le contexte via stdin."""
-        bin_name = self.user_valves.llm_bin_name
-        bin_path = self._resolve_executable(bin_name)
-        if not bin_path:
-            msg = f"Binaire LLM introuvable: {bin_name}"
-            self.logger.error(msg)
-            if __event_emitter__:
-                await __event_emitter__({
-                    "type": "status",
-                    "data": {"description": msg, "done": True, "hidden": False},
-                })
-            return None
 
-        cmd_str = self.user_valves.llm_cmd_template.format(
-            bin=bin_path, model=self.user_valves.llm_model_name, prompt=prompt
-        )
-        argv = shlex.split(cmd_str)
-        log_cmd = self.user_valves.llm_cmd_template.format(
-            bin=bin_path, model=self.user_valves.llm_model_name, prompt="<prompt>"
-        )
+        if llm_cli == "gemini":
+            argv = [
+                bin_path,
+                "--model",
+                self.user_valves.llm_model_name,
+                "-p",
+                prompt,
+            ]
+        else:
+            argv = [
+                bin_path,
+                "--model",
+                self.user_valves.llm_model_name,
+                "--prompt",
+                prompt,
+            ]
+
+        log_cmd = " ".join(argv[:-1] + ["<prompt>"])
         context_size = len(context.encode("utf-8"))
         self.logger.info(
             f"Exécution LLM: {log_cmd} | contexte {context_size} octets"
@@ -1265,40 +1434,65 @@ Le contexte du dépôt a été injecté et est maintenant disponible pour vos qu
             return None
 
     async def _save_analysis_metadata(
-        self, 
-        analysis_dir: str, 
-        repo_info: Dict[str, str], 
-        llm_cli: str, 
-        synthesis_count: int
+        self,
+        repo_path: str,
+        repo_info: Dict[str, str],
+        file_stats: Dict[str, Any],
+        llm_info: Dict[str, str],
+        synthesis_count: int,
+        prev_metadata: Optional[dict] = None,
     ) -> None:
-        """
-        Sauvegarde les métadonnées de l'analyse
-        
-        Args:
-            analysis_dir (str): Répertoire d'analyse
-            repo_info (Dict): Informations du dépôt
-            llm_cli (str): LLM CLI utilisé
-            synthesis_count (int): Nombre de synthèses générées
-        """
+        """Sauvegarde les métadonnées de l'analyse."""
         try:
+            analysis_dir = os.path.join(repo_path, "docs_analysis")
+            os.makedirs(analysis_dir, exist_ok=True)
+
+            try:
+                head = await self._git_head(repo_path)
+            except Exception:
+                head = ""
+
+            if prev_metadata:
+                files_meta = prev_metadata.get("files", [])
+            else:
+                cap = self.valves.max_bytes_per_file
+                files_meta = []
+                for f in file_stats.get("files", []):
+                    abs_p = os.path.join(repo_path, f["path"])
+                    try:
+                        sha = self._compute_file_sha256(abs_p, cap)
+                    except Exception:
+                        sha = ""
+                    files_meta.append(
+                        {
+                            "path": f["path"],
+                            "size": f.get("size", 0),
+                            "sha256": sha,
+                            "analyzed_at": datetime.now().isoformat(),
+                        }
+                    )
+
             metadata = {
                 "repo_info": repo_info,
                 "analysis_timestamp": datetime.now().isoformat(),
-                "llm_cli_used": llm_cli,
-                "synthesis_count": synthesis_count,
-                "user_config": {
-                    "analysis_depth": self.user_valves.analysis_depth,
-                    "preferred_language": self.user_valves.preferred_language
+                "tool_version": "1.0.0",
+                "repo_head_commit": head,
+                "scan_config": {
+                    "include": file_stats.get("include_patterns", []),
+                    "exclude": file_stats.get("exclude_patterns", []),
+                    "max_file_size_kb": self.valves.max_file_size_kb,
                 },
-                "tool_version": "1.0.0"
+                "files": files_meta,
+                "llm": llm_info,
+                "synthesis_count": synthesis_count,
             }
-            
+
             metadata_path = os.path.join(analysis_dir, "analysis_metadata.json")
-            async with aiofiles.open(metadata_path, 'w', encoding='utf-8') as f:
+            async with aiofiles.open(metadata_path, "w", encoding="utf-8") as f:
                 await f.write(json.dumps(metadata, indent=2, ensure_ascii=False))
-            
+
             self.logger.info(f"Métadonnées sauvegardées: {metadata_path}")
-            
+
         except Exception as e:
             self.logger.error(f"Erreur sauvegarde métadonnées: {e}")
 
@@ -1384,13 +1578,19 @@ Le contexte du dépôt a été injecté et est maintenant disponible pour vos qu
                 async with aiofiles.open(metadata_path, 'r', encoding='utf-8') as f:
                     content = await f.read()
                     metadata = json.loads(content)
-                    
+                    llm_info = metadata.get("llm", {})
+                    llm_used = (
+                        f"{llm_info.get('cli_name', 'Inconnue')} ({llm_info.get('model', '')})"
+                        if llm_info
+                        else "Inconnue"
+                    )
+
                     return {
                         "last_analysis": metadata.get("analysis_timestamp", "Inconnue"),
-                        "llm_used": metadata.get("llm_cli_used", "Inconnue"),
+                        "llm_used": llm_used,
                         "synthesis_count": metadata.get("synthesis_count", 0),
                         "file_count": "N/A",  # TODO: calculer depuis les stats
-                        "total_size_mb": "N/A"
+                        "total_size_mb": "N/A",
                     }
             else:
                 return {
