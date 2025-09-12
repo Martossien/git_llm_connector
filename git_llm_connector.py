@@ -94,6 +94,31 @@ class Tools:
             description="Hôtes Git supportés (séparés par des virgules)"
         )
 
+        max_context_bytes: int = Field(
+            default=32 * 1024 * 1024,
+            description="Taille maximale du contexte envoyé au LLM (octets)"
+        )
+
+        max_bytes_per_file: int = Field(
+            default=512 * 1024,
+            description="Taille maximale lue par fichier pour le contexte (octets)"
+        )
+
+        extra_bin_dirs: str = Field(
+            default="",
+            description="Chemins additionnels pour les binaires LLM (séparés par ':')"
+        )
+
+        git_timeout_s: float = Field(
+            default=120.0,
+            description="Timeout pour les opérations Git (secondes)"
+        )
+
+        llm_timeout_s: float = Field(
+            default=180.0,
+            description="Timeout pour les appels LLM CLI (secondes)"
+        )
+
     class UserValves(BaseModel):
         """
         Configuration utilisateur du Git LLM Connector
@@ -135,6 +160,21 @@ class Tools:
         preferred_language: str = Field(
             default="fr",
             description="Langue préférée pour les synthèses générées (fr, en)"
+        )
+
+        llm_bin_name: str = Field(
+            default="gemini",
+            description="Nom du binaire LLM à utiliser (gemini ou qwen)"
+        )
+
+        llm_model_name: str = Field(
+            default="gemini-2.5-pro",
+            description="Nom du modèle LLM à utiliser"
+        )
+
+        llm_cmd_template: str = Field(
+            default="{bin} --model {model} --prompt {prompt}",
+            description="Gabarit de commande pour l'appel LLM CLI"
         )
 
     def __init__(self):
@@ -992,6 +1032,34 @@ Le contexte du dépôt a été injecté et est maintenant disponible pour vos qu
         except Exception:
             return False
 
+    def _redact_secrets(self, text: str) -> str:
+        """Masque les secrets communs dans le texte fourni.
+
+        Cette redaction simple remplace les valeurs sensibles par '****'.
+        """
+        try:
+            # Paires clef=valeur classiques (.env)
+            text = re.sub(
+                r"(?i)(API_KEY|SECRET|TOKEN|PASSWORD|AWS_SECRET_ACCESS_KEY)\s*=\s*[^\s]+",
+                lambda m: f"{m.group(1)}=****",
+                text,
+            )
+
+            # Jetons GitHub personnels
+            text = re.sub(r"ghp_[A-Za-z0-9]+", "ghp_****", text)
+
+            # Tokens JWT basiques
+            text = re.sub(
+                r"eyJ[\w-]+?\.[\w-]+?\.[\w-]+",
+                "****",
+                text,
+            )
+
+            return text
+        except Exception:
+            # En cas de problème de regex, retourner le texte original
+            return text
+
     async def _prepare_code_context(self, repo_path: str) -> str:
         """
         Prépare le contexte de code pour l'analyse LLM
@@ -1006,50 +1074,75 @@ Le contexte du dépôt a été injecté et est maintenant disponible pour vos qu
             str: Contexte formaté pour le LLM
         """
         try:
-            context_parts = []
-            
+            max_ctx = self.valves.max_context_bytes
+            max_file = self.valves.max_bytes_per_file
+
+            context_parts: List[str] = []
+            total_bytes = 0
+
+            marker = "[... CONTEXTE TRONQUÉ ...]"
+            marker_bytes = len(marker.encode("utf-8"))
+
+            def append_part(part: str) -> bool:
+                nonlocal total_bytes
+                part_bytes = len(part.encode("utf-8"))
+                if total_bytes + part_bytes > max_ctx:
+                    allowed = max_ctx - total_bytes - marker_bytes
+                    if allowed > 0:
+                        truncated = part.encode("utf-8")[:allowed].decode("utf-8", errors="ignore")
+                        context_parts.append(truncated)
+                        total_bytes += allowed
+                    context_parts.append(marker)
+                    total_bytes = max_ctx
+                    return False
+                context_parts.append(part)
+                total_bytes += part_bytes
+                return True
+
             # Fichiers prioritaires (README, package.json, etc.)
             priority_files = [
                 "README.md", "README.rst", "README.txt",
                 "package.json", "setup.py", "Cargo.toml", "go.mod",
                 "requirements.txt", "pyproject.toml", "composer.json"
             ]
-            
-            # Ajout des fichiers prioritaires
+
             for priority_file in priority_files:
                 file_path = os.path.join(repo_path, priority_file)
                 if os.path.exists(file_path):
                     try:
-                        async with aiofiles.open(file_path, 'r', encoding='utf-8') as f:
-                            content = await f.read()
-                            context_parts.append(f"=== {priority_file} ===\n{content}\n")
+                        async with aiofiles.open(file_path, "rb") as f:
+                            data = await f.read(max_file)
+                        content = data.decode("utf-8", errors="ignore")
+                        part = f"=== {priority_file} ===\n{content}\n"
+                        if not append_part(part):
+                            self.logger.info(f"Contexte tronqué à {total_bytes} octets")
+                            return self._redact_secrets("".join(context_parts))
                     except Exception:
                         continue
-            
+
             # Scan des fichiers du projet selon la profondeur d'analyse
             file_stats = await self._scan_repository_files(repo_path)
-            
-            # Sélection intelligente des fichiers à inclure
-            depth_limits = {
-                "quick": 10,
-                "standard": 25,
-                "deep": 50
-            }
-            
+
+            depth_limits = {"quick": 10, "standard": 25, "deep": 50}
             max_files = depth_limits.get(self.user_valves.analysis_depth, 25)
             selected_files = file_stats["files"][:max_files]
-            
+
             for file_info in selected_files:
                 file_path = os.path.join(repo_path, file_info["path"])
                 try:
-                    async with aiofiles.open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                        content = await f.read()
-                        context_parts.append(f"=== {file_info['path']} ===\n{content}\n")
+                    async with aiofiles.open(file_path, "rb") as f:
+                        data = await f.read(max_file)
+                    content = data.decode("utf-8", errors="ignore")
+                    part = f"=== {file_info['path']} ===\n{content}\n"
+                    if not append_part(part):
+                        self.logger.info(f"Contexte tronqué à {total_bytes} octets")
+                        return self._redact_secrets("".join(context_parts))
                 except Exception:
                     continue
-            
-            return "\n".join(context_parts)
-            
+
+            self.logger.info(f"Contexte total préparé: {total_bytes} octets")
+            return self._redact_secrets("".join(context_parts))
+
         except Exception as e:
             self.logger.error(f"Erreur préparation contexte: {e}")
             return ""
