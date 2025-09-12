@@ -1,0 +1,56 @@
+# Git LLM Connector - Dépendances Python
+# Version 1.0.0 - Compatible Open WebUI 0.6.0+
+
+# Dépendances principales (requises dans le docstring du tool)
+aiofiles>=23.1.0           # I/O fichiers asynchrone
+asyncio                    # Module standard Python (pas d'installation nécessaire)
+gitpython>=3.1.31          # Interface Python pour Git
+pathspec>=0.11.1           # Patterns glob avancés (style gitignore)
+pydantic>=2.0.0            # Validation et sérialisation des données
+
+# Dépendances optionnelles pour LLM CLI externes
+# Note: Ces dépendances doivent être installées séparément selon le choix utilisateur
+
+# Pour Qwen CLI:
+# qwen-cli                 # CLI officiel Qwen (installation séparée recommandée)
+
+# Pour Gemini CLI:
+# google-generativeai      # SDK Google Gemini (installation séparée recommandée)
+
+# Dépendances système requises (à installer via gestionnaire de paquets):
+# - git (>= 2.20.0)       # Système de contrôle de version Git
+# - python (>= 3.8.0)     # Interpréteur Python
+
+# Dépendances développement (optionnelles)
+# pytest>=7.0.0           # Framework de tests
+# black>=23.0.0           # Formatage de code
+# flake8>=6.0.0           # Linting
+# mypy>=1.0.0             # Type checking statique
+
+# Notes d'installation:
+# 1. Installation de base:
+#    pip install -r requirements.txt
+#
+# 2. Installation avec LLM CLI (choisir l'un ou l'autre):
+#    pip install -r requirements.txt qwen-cli
+#    ou
+#    pip install -r requirements.txt google-generativeai
+#
+# 3. Vérification des prérequis système:
+#    git --version
+#    python --version
+#
+# 4. Configuration post-installation:
+#    - Configurer Git: git config --global user.name "Nom"
+#    - Configurer Git: git config --global user.email "email@example.com" 
+#    - Tester LLM CLI: qwen --version ou python -c "import google.generativeai"
+#
+# 5. Permissions (Unix/Linux):
+#    chmod +x git_llm_connector.py
+#    mkdir -p ~/OW_tools/git_repos ~/OW_tools/logs
+
+# Compatibilité testée:
+# - Python 3.8+
+# - Open WebUI 0.6.0+
+# - Git 2.20.0+
+# - Linux/macOS/Windows (via WSL recommendé pour Windows)
