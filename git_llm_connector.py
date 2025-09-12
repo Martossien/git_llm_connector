@@ -25,6 +25,8 @@ import re
 from datetime import datetime
 from urllib.parse import urlparse
 from pathlib import Path
+import shlex
+import time
 
 class Tools:
     """
@@ -942,7 +944,9 @@ Le contexte du dépôt a été injecté et est maintenant disponible pour vos qu
                 
                 try:
                     prompt = self._analysis_prompts[analysis_type][lang]
-                    result = await self._execute_llm_cli(llm_cli, prompt, code_context)
+                    result = await self._execute_llm_cli(
+                        llm_cli, prompt, code_context, __event_emitter__
+                    )
                     
                     if result:
                         file_path = os.path.join(analysis_dir, filename)
@@ -998,37 +1002,56 @@ Le contexte du dépôt a été injecté et est maintenant disponible pour vos qu
             self.logger.error(f"Erreur détection LLM CLI: {e}")
             return None
 
-    async def _test_llm_cli(self, llm_name: str) -> bool:
-        """
-        Test la disponibilité d'un LLM CLI spécifique
-        
+    def _resolve_executable(self, name: str) -> Optional[str]:
+        """Résout le chemin absolu d'un exécutable.
+
+        Recherche dans le PATH courant puis dans les répertoires
+        additionnels définis par ``extra_bin_dirs`` (séparés par ``:``).
+
         Args:
-            llm_name (str): Nom du LLM CLI à tester
-            
+            name: Nom de l'exécutable à rechercher.
+
         Returns:
-            bool: True si disponible
+            Chemin absolu de l'exécutable ou ``None`` si introuvable.
         """
+        path = shutil.which(name)
+        if path:
+            return path
+
+        extra = self.valves.extra_bin_dirs
+        if extra:
+            for d in extra.split(":"):
+                d = d.strip()
+                if not d:
+                    continue
+                candidate = shutil.which(os.path.join(os.path.expanduser(d), name))
+                if candidate:
+                    return candidate
+        return None
+
+    async def _test_llm_cli(self, llm_name: str) -> bool:
+        """Test la disponibilité d'un LLM CLI spécifique."""
         try:
-            # Commandes de test selon le LLM
-            test_commands = {
-                "qwen": ["qwen", "--version"],
-                "gemini": ["gemini", "--version"]
-            }
-            
-            if llm_name not in test_commands:
-                return False
-            
-            cmd = test_commands[llm_name]
-            
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
+            # Utilise un binaire personnalisé si l'utilisateur a choisi ce LLM
+            bin_name = (
+                self.user_valves.llm_bin_name
+                if llm_name == self.user_valves.llm_cli_choice.lower()
+                else llm_name
             )
-            
+            bin_path = self._resolve_executable(bin_name)
+            if not bin_path:
+                return False
+
+            process = await asyncio.create_subprocess_exec(
+                bin_path,
+                "--version",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+
             await asyncio.wait_for(process.communicate(), timeout=10)
             return process.returncode == 0
-            
+
         except Exception:
             return False
 
@@ -1147,57 +1170,98 @@ Le contexte du dépôt a été injecté et est maintenant disponible pour vos qu
             self.logger.error(f"Erreur préparation contexte: {e}")
             return ""
 
-    async def _execute_llm_cli(self, llm_cli: str, prompt: str, context: str) -> Optional[str]:
-        """
-        Exécute le LLM CLI avec le prompt et le contexte
-        
-        Args:
-            llm_cli (str): Nom du LLM CLI à utiliser
-            prompt (str): Prompt d'analyse
-            context (str): Contexte de code
-            
-        Returns:
-            Résultat de l'analyse ou None si échec
-        """
+    async def _execute_llm_cli(
+        self,
+        llm_cli: str,
+        prompt: str,
+        context: str,
+        __event_emitter__: Optional[Callable[[dict], Awaitable[None]]] = None,
+    ) -> Optional[str]:
+        """Exécute le LLM CLI avec le prompt et le contexte via stdin."""
+        bin_name = self.user_valves.llm_bin_name
+        bin_path = self._resolve_executable(bin_name)
+        if not bin_path:
+            msg = f"Binaire LLM introuvable: {bin_name}"
+            self.logger.error(msg)
+            if __event_emitter__:
+                await __event_emitter__({
+                    "type": "status",
+                    "data": {"description": msg, "done": True, "hidden": False},
+                })
+            return None
+
+        cmd_str = self.user_valves.llm_cmd_template.format(
+            bin=bin_path, model=self.user_valves.llm_model_name, prompt=prompt
+        )
+        argv = shlex.split(cmd_str)
+        log_cmd = self.user_valves.llm_cmd_template.format(
+            bin=bin_path, model=self.user_valves.llm_model_name, prompt="<prompt>"
+        )
+        context_size = len(context.encode("utf-8"))
+        self.logger.info(
+            f"Exécution LLM: {log_cmd} | contexte {context_size} octets"
+        )
+
+        start = time.perf_counter()
         try:
-            # Préparation de l'input complet
-            full_input = f"{prompt}\n\nCONTEXTE DU CODE:\n{context}"
-            
-            # Commandes selon le LLM CLI
-            if llm_cli == "qwen":
-                cmd = ["qwen", "--input", "-"]
-            elif llm_cli == "gemini":
-                cmd = ["gemini", "generate", "--input", "-"]
-            else:
-                raise ValueError(f"LLM CLI non supporté: {llm_cli}")
-            
-            # Exécution
             process = await asyncio.create_subprocess_exec(
-                *cmd,
+                *argv,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
+                stderr=asyncio.subprocess.PIPE,
             )
-            
+
             stdout, stderr = await asyncio.wait_for(
-                process.communicate(input=full_input.encode('utf-8')),
-                timeout=self.valves.default_timeout
+                process.communicate(input=context.encode("utf-8")),
+                timeout=self.valves.llm_timeout_s,
             )
-            
-            if process.returncode == 0:
-                result = stdout.decode('utf-8').strip()
-                self.logger.debug(f"LLM CLI résultat: {len(result)} caractères")
-                return result
-            else:
-                error = stderr.decode('utf-8')
-                self.logger.error(f"Erreur LLM CLI: {error}")
+            duration = time.perf_counter() - start
+            out_text = stdout.decode("utf-8", errors="ignore")
+            err_text = stderr.decode("utf-8", errors="ignore")
+
+            if process.returncode != 0:
+                self.logger.error(
+                    f"LLM CLI échec (code {process.returncode}) après {duration:.1f}s: {err_text.strip()}"
+                )
+                if __event_emitter__:
+                    truncated = (
+                        err_text.strip()[:200] + "..."
+                        if len(err_text.strip()) > 200
+                        else err_text.strip()
+                    )
+                    await __event_emitter__({
+                        "type": "status",
+                        "data": {
+                            "description": f"Erreur LLM CLI: {truncated}",
+                            "done": True,
+                            "hidden": False,
+                        },
+                    })
                 return None
-                
+
+            self.logger.info(
+                f"LLM CLI terminé en {duration:.1f}s (code {process.returncode})"
+            )
+            return out_text.strip()
+
         except asyncio.TimeoutError:
-            self.logger.error(f"Timeout LLM CLI après {self.valves.default_timeout}s")
+            process.kill()
+            await process.communicate()
+            msg = f"Timeout LLM CLI après {self.valves.llm_timeout_s}s"
+            self.logger.error(msg)
+            if __event_emitter__:
+                await __event_emitter__({
+                    "type": "status",
+                    "data": {"description": msg, "done": True, "hidden": False},
+                })
             return None
         except Exception as e:
-            self.logger.error(f"Erreur exécution LLM CLI: {e}")
+            self.logger.error(f"Erreur exécution LLM CLI: {e}", exc_info=True)
+            if __event_emitter__:
+                await __event_emitter__({
+                    "type": "status",
+                    "data": {"description": f"Erreur LLM CLI: {e}", "done": True, "hidden": False},
+                })
             return None
 
     async def _save_analysis_metadata(
