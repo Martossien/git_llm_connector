@@ -7,7 +7,7 @@ description: Tool Open WebUI pour cloner, analyser et résumer des dépôts Git 
 required_open_webui_version: 0.6.0
 version: 0.1.0
 license: MIT
-requirements: aiofiles pathspec pydantic
+requirements: aiofiles,pathspec,pydantic
 """
 
 from typing import Optional, Callable, Awaitable, Any, List, Dict, Union
