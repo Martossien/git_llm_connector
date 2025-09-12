@@ -1,13 +1,13 @@
 """
 title: Git LLM Connector
-author: Claude Code Assistant
-author_url: https://github.com/anthropics/claude-code
-git_url: https://github.com/your-repo/git-llm-connector
-description: Tool sophistiqué pour cloner, analyser et injecter le contexte de dépôts Git via des LLM CLI externes (Qwen/Gemini). Génère automatiquement des synthèses ARCHITECTURE.md, API_SUMMARY.md, CODE_MAP.md pour une compréhension approfondie des codebases.
+author: Martossien
+author_url: https://github.com/Martossien
+git_url: https://github.com/Martossien/git_llm_connector
+description: Tool Open WebUI pour cloner, analyser et résumer des dépôts Git à l'aide de LLM accessibles via les CLI Gemini ou Qwen.
 required_open_webui_version: 0.6.0
-version: 1.0.0
+version: 0.1.0
 license: MIT
-requirements: aiofiles asyncio gitpython pathspec pydantic
+requirements: aiofiles pathspec pydantic
 """
 
 from typing import Optional, Callable, Awaitable, Any, List, Dict, Union
