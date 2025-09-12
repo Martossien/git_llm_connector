@@ -5,10 +5,12 @@ author_url: https://github.com/Martossien
 git_url: https://github.com/Martossien/git_llm_connector
 description: Tool Open WebUI pour cloner, analyser et résumer des dépôts Git à l'aide de LLM accessibles via les CLI Gemini ou Qwen.
 required_open_webui_version: 0.6.0
-version: 0.1.0
+version: 0.2.0
 license: MIT
 requirements: aiofiles,pathspec,pydantic
 """
+
+TOOL_VERSION = "0.2.0"
 
 from typing import Optional, Callable, Awaitable, Any, List, Dict, Union, Literal, Tuple
 from pydantic import BaseModel, Field
@@ -159,6 +161,10 @@ class Tools:
             default="",
             description="Patterns personnalisés de fichiers à exclure (laissez vide pour utiliser les défauts)"
         )
+        focus_paths: str = Field(
+            default="",
+            description="Sous-chemins relatifs du dépôt à analyser (séparés par des virgules)",
+        )
         
         analysis_depth: str = Field(
             default="standard",
@@ -281,13 +287,15 @@ class Tools:
         self.logger.info(f"Système de logging configuré - Fichier: {log_file}")
 
     async def analyze_repo(
-        self, 
+        self,
         repo_url: str,
-        __event_emitter__: Optional[Callable[[dict], Awaitable[None]]] = None
+        __event_emitter__: Optional[Callable[[dict], Awaitable[None]]] = None,
+        force: bool = False,
+        mode: Optional[str] = None,
     ) -> str:
         """
         Fonction principale d'analyse d'un dépôt Git
-        
+
         Cette fonction orchestre l'ensemble du processus :
         1. Parse et validation de l'URL
         2. Clone ou mise à jour du dépôt
@@ -307,6 +315,7 @@ class Tools:
             ValueError: Si l'URL est invalide ou non supportée
             RuntimeError: Si l'analyse échoue
         """
+        orig_mode = self.user_valves.analysis_mode
         try:
             self.logger.info(f"🚀 Démarrage analyse repo: {repo_url}")
             
@@ -337,7 +346,13 @@ class Tools:
             
             # 2. Clone ou mise à jour du dépôt
             local_path = await self._clone_or_update_repo(repo_info, __event_emitter__)
-            
+
+            orig_mode = self.user_valves.analysis_mode
+            effective_mode = mode if mode else orig_mode
+            if force:
+                effective_mode = "full"
+            self.user_valves.analysis_mode = effective_mode
+
             if __event_emitter__:
                 await __event_emitter__({
                     "type": "status",
@@ -347,7 +362,7 @@ class Tools:
                         "hidden": False
                     }
                 })
-            
+
             # 3. Scan des fichiers selon les patterns
             file_stats = await self._scan_repository_files(local_path)
             self.logger.info(
@@ -355,7 +370,7 @@ class Tools:
             )
 
             should_reanalyze, prev_meta = await self._should_reanalyze(
-                local_path, file_stats["files"], self.user_valves.analysis_mode
+                local_path, file_stats["files"], effective_mode, force
             )
 
             analysis_dir = os.path.join(local_path, "docs_analysis")
@@ -440,9 +455,7 @@ class Tools:
                 if llm_info
                 else "N/A"
             )
-            synth_display = (
-                "0 (réutilisées)" if not should_reanalyze else str(len(synthesis_files))
-            )
+            synth_display = f"{len(synthesis_files)} ({'générées' if should_reanalyze else 'réutilisées'})"
             summary = f"""
 ## 📊 Analyse du dépôt {repo_info['owner']}/{repo_info['repo']} terminée
 
@@ -451,7 +464,7 @@ class Tools:
 - 📦 Taille totale : {file_stats['total_size_mb']:.1f} MB
 - 🗂️ Types de fichiers : {', '.join(file_stats['file_types'][:5])}
 - 🤖 LLM utilisé : {llm_used}
-- 📋 Synthèses générées : {synth_display}
+- 📋 Synthèses : {synth_display}
 
 Le contexte du dépôt a été injecté et est maintenant disponible pour vos questions !
 """
@@ -460,9 +473,12 @@ Le contexte du dépôt a été injecté et est maintenant disponible pour vos qu
             return summary
             
         except Exception as e:
-            error_msg = f"❌ Erreur lors de l'analyse du dépôt: {str(e)}"
+            msg = str(e)
+            if len(msg) > 200:
+                msg = msg[:200] + "..."
+            error_msg = f"❌ Erreur lors de l'analyse du dépôt: {msg}"
             self.logger.error(f"Erreur analyse repo {repo_url}: {e}", exc_info=True)
-            
+
             if __event_emitter__:
                 await __event_emitter__({
                     "type": "status",
@@ -472,13 +488,17 @@ Le contexte du dépôt a été injecté et est maintenant disponible pour vos qu
                         "hidden": False
                     }
                 })
-            
+
             return error_msg
+        finally:
+            self.user_valves.analysis_mode = orig_mode
 
     async def sync_repo(
         self,
         repo_name: str,
-        __event_emitter__: Optional[Callable[[dict], Awaitable[None]]] = None
+        __event_emitter__: Optional[Callable[[dict], Awaitable[None]]] = None,
+        force: bool = False,
+        mode: Optional[str] = None,
     ) -> str:
         """
         Synchronise un dépôt déjà cloné
@@ -493,6 +513,7 @@ Le contexte du dépôt a été injecté et est maintenant disponible pour vos qu
         Returns:
             str: Résultat de la synchronisation
         """
+        orig_mode = self.user_valves.analysis_mode
         try:
             self.logger.info(f"🔄 Synchronisation repo: {repo_name}")
             
@@ -515,9 +536,14 @@ Le contexte du dépôt a été injecté et est maintenant disponible pour vos qu
             
             await self._run_git_command(repo_path, ["pull", "origin"], __event_emitter__)
 
+            effective_mode = mode if mode else orig_mode
+            if force:
+                effective_mode = "full"
+            self.user_valves.analysis_mode = effective_mode
+
             file_stats = await self._scan_repository_files(repo_path)
             should_reanalyze, prev_meta = await self._should_reanalyze(
-                repo_path, file_stats["files"], self.user_valves.analysis_mode
+                repo_path, file_stats["files"], effective_mode, force
             )
 
             repo_info = {
@@ -558,9 +584,12 @@ Le contexte du dépôt a été injecté et est maintenant disponible pour vos qu
                 })
 
             return msg
-                
+
         except Exception as e:
-            error_msg = f"❌ Erreur synchronisation {repo_name}: {str(e)}"
+            msg = str(e)
+            if len(msg) > 200:
+                msg = msg[:200] + "..."
+            error_msg = f"❌ Erreur synchronisation {repo_name}: {msg}"
             self.logger.error(error_msg, exc_info=True)
             
             if __event_emitter__:
@@ -574,6 +603,8 @@ Le contexte du dépôt a été injecté et est maintenant disponible pour vos qu
                 })
             
             return error_msg
+        finally:
+            self.user_valves.analysis_mode = orig_mode
 
     async def list_analyzed_repos(
         self,
@@ -889,6 +920,20 @@ Le contexte du dépôt a été injecté et est maintenant disponible pour vos qu
         out = await self._run_git_command(repo_path, ["rev-parse", "HEAD"])
         return out.strip()
 
+    def _is_binary_file(self, path: str) -> bool:
+        try:
+            with open(path, "rb") as f:
+                sample = f.read(2048)
+            if b"\0" in sample:
+                return True
+            try:
+                sample.decode("utf-8")
+                return False
+            except UnicodeDecodeError:
+                return True
+        except Exception:
+            return True
+
     def _compute_file_sha256(self, abs_path: str, cap_bytes: int) -> str:
         h = hashlib.sha256()
         with open(abs_path, "rb") as f:
@@ -910,9 +955,10 @@ Le contexte du dépôt a été injecté et est maintenant disponible pour vos qu
         repo_path: str,
         scanned_files: List[Dict[str, Any]],
         mode: str,
+        force: bool = False,
     ) -> Tuple[bool, dict]:
         """Détermine si une ré-analyse est nécessaire."""
-        if mode == "full":
+        if force or mode == "full":
             prev = await self._load_metadata(repo_path)
             return True, prev or {}
 
@@ -929,11 +975,13 @@ Le contexte du dépôt a été injecté et est maintenant disponible pour vos qu
             cap = self.valves.max_bytes_per_file
             prev_map = {f["path"]: f.get("sha256") for f in prev.get("files", [])}
             for f in scanned_files:
-                abs_p = os.path.join(repo_path, f["path"])
-                try:
-                    cur_sha = self._compute_file_sha256(abs_p, cap)
-                except Exception:
-                    return True, prev
+                cur_sha = f.get("sha256")
+                if not cur_sha:
+                    abs_p = os.path.join(repo_path, f["path"])
+                    try:
+                        cur_sha = self._compute_file_sha256(abs_p, cap)
+                    except Exception:
+                        return True, prev
                 if prev_map.get(f["path"]) != cur_sha:
                     return True, prev
             return False, prev
@@ -968,46 +1016,55 @@ Le contexte du dépôt a été injecté et est maintenant disponible pour vos qu
             # Création des specs pathspec
             include_spec = pathspec.PathSpec.from_lines('gitwildmatch', include_patterns)
             exclude_spec = pathspec.PathSpec.from_lines('gitwildmatch', exclude_patterns)
-            
-            files_found = []
+
+            files_found: List[Dict[str, Any]] = []
             total_size = 0
             file_types = set()
-            
-            # Parcours récursif
-            for root, dirs, files in os.walk(repo_path):
-                # Filtrage des dossiers exclus (chemins relatifs)
-                dirs[:] = [
-                    d
-                    for d in dirs
-                    if not exclude_spec.match_file(os.path.relpath(os.path.join(root, d), repo_path))
-                ]
-                
-                for file in files:
-                    file_path = os.path.join(root, file)
-                    rel_path = os.path.relpath(file_path, repo_path)
-                    
-                    # Application des patterns
-                    if include_spec.match_file(rel_path) and not exclude_spec.match_file(rel_path):
-                        try:
-                            file_stat = os.stat(file_path)
-                            file_size = file_stat.st_size
-                            
-                            # Vérification taille maximale
-                            if file_size <= self.valves.max_file_size_kb * 1024:
-                                files_found.append({
-                                    "path": rel_path,
-                                    "size": file_size,
-                                    "ext": os.path.splitext(file)[1].lower()
-                                })
-                                total_size += file_size
-                                
-                                # Collecte des types de fichiers
-                                ext = os.path.splitext(file)[1].lower()
-                                if ext:
-                                    file_types.add(ext[1:])  # Sans le point
-                                    
-                        except OSError:
-                            continue  # Fichier inaccessible
+
+            focus_paths = [p.strip().strip('/\\') for p in self.user_valves.focus_paths.split(',') if p.strip()]
+            roots = [repo_path] if not focus_paths else []
+            for fp in focus_paths:
+                abs_fp = os.path.join(repo_path, fp)
+                if os.path.isdir(abs_fp):
+                    roots.append(abs_fp)
+            if not roots:
+                roots = [repo_path]
+
+            cap = self.valves.max_bytes_per_file
+
+            for base in roots:
+                for root, dirs, files in os.walk(base):
+                    dirs[:] = [
+                        d
+                        for d in dirs
+                        if not exclude_spec.match_file(os.path.relpath(os.path.join(root, d), repo_path))
+                    ]
+
+                    for file in files:
+                        file_path = os.path.join(root, file)
+                        rel_path = os.path.relpath(file_path, repo_path)
+
+                        if include_spec.match_file(rel_path) and not exclude_spec.match_file(rel_path):
+                            try:
+                                file_stat = os.stat(file_path)
+                                file_size = file_stat.st_size
+                                if file_size <= self.valves.max_file_size_kb * 1024:
+                                    try:
+                                        sha = self._compute_file_sha256(file_path, cap)
+                                    except Exception:
+                                        sha = ""
+                                    files_found.append({
+                                        "path": rel_path,
+                                        "size": file_size,
+                                        "ext": os.path.splitext(file)[1].lower(),
+                                        "sha256": sha,
+                                    })
+                                    total_size += file_size
+                                    ext = os.path.splitext(file)[1].lower()
+                                    if ext:
+                                        file_types.add(ext[1:])
+                            except OSError:
+                                continue
             
             stats = {
                 "total_files": len(files_found),
@@ -1053,12 +1110,32 @@ Le contexte du dépôt a été injecté et est maintenant disponible pour vos qu
             )
             bin_path = self._resolve_executable(bin_name)
             if not bin_path:
-                self.logger.error(f"Binaire LLM introuvable: {bin_name}")
+                msg = f"Binaire LLM introuvable: {bin_name}"
+                self.logger.error(msg)
+                if __event_emitter__:
+                    await __event_emitter__({
+                        "type": "status",
+                        "data": {"description": msg[:200], "done": True, "hidden": False},
+                    })
                 return [], {}
+            self.logger.info(f"Binaire LLM utilisé: {bin_path}")
 
-            code_context = await self._prepare_code_context(
+            code_context, changed_count = await self._prepare_code_context(
                 repo_path, file_stats, prev_metadata
             )
+            if (
+                self.user_valves.analysis_mode == "diff"
+                and changed_count == 0
+                and __event_emitter__
+            ):
+                await __event_emitter__({
+                    "type": "status",
+                    "data": {
+                        "description": "Aucun fichier modifié détecté, contexte limité aux fichiers prioritaires",
+                        "done": False,
+                        "hidden": False,
+                    },
+                })
 
             synthesis_files = []
             lang = self.user_valves.preferred_language
@@ -1233,18 +1310,12 @@ Le contexte du dépôt a été injecté et est maintenant disponible pour vos qu
         repo_path: str,
         file_stats: Optional[Dict[str, Any]] = None,
         prev_metadata: Optional[dict] = None,
-    ) -> str:
+    ) -> Tuple[str, int]:
         """
-        Prépare le contexte de code pour l'analyse LLM
-        
-        Sélectionne et formate les fichiers les plus importants
-        du dépôt pour alimenter l'analyse LLM.
-        
-        Args:
-            repo_path (str): Chemin du dépôt
-            
+        Prépare le contexte de code pour l'analyse LLM.
+
         Returns:
-            str: Contexte formaté pour le LLM
+            Tuple[str, int]: Contexte formaté et nombre de fichiers ajoutés.
         """
         try:
             max_ctx = self.valves.max_context_bytes
@@ -1252,6 +1323,7 @@ Le contexte du dépôt a été injecté et est maintenant disponible pour vos qu
 
             context_parts: List[str] = []
             total_bytes = 0
+            changed_files = 0
 
             marker = "[... CONTEXTE TRONQUÉ ...]"
             marker_bytes = len(marker.encode("utf-8"))
@@ -1272,7 +1344,6 @@ Le contexte du dépôt a été injecté et est maintenant disponible pour vos qu
                 total_bytes += part_bytes
                 return True
 
-            # Fichiers prioritaires (README, package.json, etc.)
             priority_files = [
                 "README.md", "README.rst", "README.txt",
                 "package.json", "setup.py", "Cargo.toml", "go.mod",
@@ -1281,7 +1352,7 @@ Le contexte du dépôt a été injecté et est maintenant disponible pour vos qu
 
             for priority_file in priority_files:
                 file_path = os.path.join(repo_path, priority_file)
-                if os.path.exists(file_path):
+                if os.path.exists(file_path) and not self._is_binary_file(file_path):
                     try:
                         async with aiofiles.open(file_path, "rb") as f:
                             data = await f.read(max_file)
@@ -1289,7 +1360,7 @@ Le contexte du dépôt a été injecté et est maintenant disponible pour vos qu
                         part = f"=== {priority_file} ===\n{content}\n"
                         if not append_part(part):
                             self.logger.info(f"Contexte tronqué à {total_bytes} octets")
-                            return self._redact_secrets("".join(context_parts))
+                            return self._redact_secrets("".join(context_parts)), changed_files
                     except Exception:
                         continue
 
@@ -1305,38 +1376,44 @@ Le contexte du dépôt a été injecté et est maintenant disponible pour vos qu
             ):
                 prev_map = {f["path"]: f.get("sha256") for f in prev_metadata.get("files", [])}
                 changed = []
-                cap = self.valves.max_bytes_per_file
                 for f in files_list:
-                    abs_p = os.path.join(repo_path, f["path"])
-                    try:
-                        cur_sha = self._compute_file_sha256(abs_p, cap)
-                    except Exception:
-                        continue
-                    if prev_map.get(f["path"]) != cur_sha:
+                    if prev_map.get(f["path"]) != f.get("sha256"):
                         changed.append(f)
                 files_list = changed
 
             selected_files = files_list[:max_files]
 
-            for file_info in selected_files:
-                file_path = os.path.join(repo_path, file_info["path"])
-                try:
-                    async with aiofiles.open(file_path, "rb") as f:
-                        data = await f.read(max_file)
-                    content = data.decode("utf-8", errors="ignore")
-                    part = f"=== {file_info['path']} ===\n{content}\n"
-                    if not append_part(part):
-                        self.logger.info(f"Contexte tronqué à {total_bytes} octets")
-                        return self._redact_secrets("".join(context_parts))
-                except Exception:
+            sem = asyncio.Semaphore(8)
+
+            async def read_file(info: Dict[str, Any]) -> Tuple[str, Optional[str]]:
+                path = os.path.join(repo_path, info["path"])
+                if self._is_binary_file(path):
+                    return info["path"], None
+                async with sem:
+                    try:
+                        async with aiofiles.open(path, "rb") as f:
+                            data = await f.read(max_file)
+                        return info["path"], data.decode("utf-8", errors="ignore")
+                    except Exception:
+                        return info["path"], None
+
+            results = await asyncio.gather(*(read_file(f) for f in selected_files))
+
+            for rel_path, content in results:
+                if content is None:
                     continue
+                part = f"=== {rel_path} ===\n{content}\n"
+                if not append_part(part):
+                    self.logger.info(f"Contexte tronqué à {total_bytes} octets")
+                    return self._redact_secrets("".join(context_parts)), changed_files
+                changed_files += 1
 
             self.logger.info(f"Contexte total préparé: {total_bytes} octets")
-            return self._redact_secrets("".join(context_parts))
+            return self._redact_secrets("".join(context_parts)), changed_files
 
         except Exception as e:
             self.logger.error(f"Erreur préparation contexte: {e}")
-            return ""
+            return "", 0
 
     async def _execute_llm_cli(
         self,
@@ -1455,27 +1532,20 @@ Le contexte du dépôt a été injecté et est maintenant disponible pour vos qu
             if prev_metadata:
                 files_meta = prev_metadata.get("files", [])
             else:
-                cap = self.valves.max_bytes_per_file
-                files_meta = []
-                for f in file_stats.get("files", []):
-                    abs_p = os.path.join(repo_path, f["path"])
-                    try:
-                        sha = self._compute_file_sha256(abs_p, cap)
-                    except Exception:
-                        sha = ""
-                    files_meta.append(
-                        {
-                            "path": f["path"],
-                            "size": f.get("size", 0),
-                            "sha256": sha,
-                            "analyzed_at": datetime.now().isoformat(),
-                        }
-                    )
+                files_meta = [
+                    {
+                        "path": f["path"],
+                        "size": f.get("size", 0),
+                        "sha256": f.get("sha256", ""),
+                        "analyzed_at": datetime.now().isoformat(),
+                    }
+                    for f in file_stats.get("files", [])
+                ]
 
             metadata = {
                 "repo_info": repo_info,
                 "analysis_timestamp": datetime.now().isoformat(),
-                "tool_version": "1.0.0",
+                "tool_version": TOOL_VERSION,
                 "repo_head_commit": head,
                 "scan_config": {
                     "include": file_stats.get("include_patterns", []),
@@ -1584,13 +1654,14 @@ Le contexte du dépôt a été injecté et est maintenant disponible pour vos qu
                         if llm_info
                         else "Inconnue"
                     )
-
+                    files = metadata.get("files", [])
+                    total_size = sum(f.get("size", 0) for f in files)
                     return {
                         "last_analysis": metadata.get("analysis_timestamp", "Inconnue"),
                         "llm_used": llm_used,
                         "synthesis_count": metadata.get("synthesis_count", 0),
-                        "file_count": "N/A",  # TODO: calculer depuis les stats
-                        "total_size_mb": "N/A",
+                        "file_count": len(files),
+                        "total_size_mb": round(total_size / (1024 * 1024), 1),
                     }
             else:
                 return {
