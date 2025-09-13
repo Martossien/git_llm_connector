@@ -54,6 +54,7 @@ gemini  # First run: authenticate with Google account
 3. Paste the entire `git_llm_connector.py` content
 4. Save
 5. Activate in conversations using **+**
+6. put the prompt project, with this the llm can use the fonction or/and you can use the fonction directly in the chat  
 
 ## Available Functions (18 total)
 
