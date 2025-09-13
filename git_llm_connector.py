@@ -3,22 +3,21 @@ title: Git LLM Connector
 author: Martossien
 author_url: https://github.com/Martossien
 git_url: https://github.com/Martossien/git_llm_connector
-description: v1.8 advanced — Git + LLM with AST parsing (Tree-sitter), hybrid retrieval (BM25 + embeddings), call graph analysis, and enhanced RAG capabilities. All via CLI (gemini/qwen). Secure, bounded context, detailed logs, stable paths, LLM timeout=900s.
+description: v1.9 UX-focused — Git + LLM with developer UX enhancements: file outlining, test discovery, recent changes tracking. Built on solid v1.8 foundation (AST, hybrid retrieval, call graph). All via CLI (gemini/qwen). Secure, bounded context, detailed logs, stable paths, LLM timeout=900s.
 required_open_webui_version: 0.6.0
-version: 0.1.8
+version: 0.1.9
 license: MIT
 requirements: aiofiles,pathspec,pydantic
 
-CHANGELOG v1.8:
-- NEW: AST parsing with Tree-sitter for Python/JS/TS (fallback to regex)
-- NEW: Hybrid retrieval - hybrid_retrieve() with BM25 + optional embeddings
-- NEW: Call graph analysis - show_call_graph() with cross-references
-- NEW: Enhanced show_related_code() with AST symbols and call graph
-- NEW: Improved deduplication using MinHash for better similarity detection
-- NEW: Extended user valves for retrieval backend selection and tuning
-- Enhanced: auto_retrieve_context() supports multiple retrieval backends
-- Enhanced: Better attribution and source tracking across all RAG functions
-- Maintained: All v1.6/v1.7 functions with full backward compatibility
+CHANGELOG v1.9:
+- NEW: File outlining - outline_file() for large file navigation
+- NEW: Test discovery - find_tests_for() symbol/file test finder
+- NEW: Recent changes - recent_changes() git history summary for context
+- NEW: Developer UX focus with orchestration documentation
+- Enhanced: Better navigation workflow for complex codebases
+- Enhanced: Test-driven development support with smart test discovery
+- Enhanced: Git-aware context for debugging recent changes
+- Maintained: All v1.6/v1.7/v1.8 functions with full backward compatibility
 """
 
 from typing import Any, List, Dict, Set, Tuple, Optional, Union
@@ -3291,7 +3290,585 @@ class Tools:
             self.logger.error("[XREF] show_call_graph error: %s", e)
             return f"❌ Erreur show_call_graph: {e}"
 
+    # =====================================================================
+    # 🆕 NEW v1.9 DEVELOPER UX FUNCTIONS
+    # =====================================================================
+
+    def outline_file(self, repo_name: str, path: str, max_items: int = 200) -> str:
+        """
+        Generate structural outline of a large file for better navigation.
+
+        Args:
+            repo_name: Repository name (sanitized)
+            path: Relative path to file within repo
+            max_items: Maximum items to display (1-1000, clamped to 200)
+
+        Returns:
+            Formatted markdown outline with functions, classes, and structure
+        """
+        try:
+            p = self._paths()
+            safe = self._sanitize_repo_name(repo_name)
+            repo_dir = os.path.join(p["repos"], safe)
+
+            if not os.path.isdir(repo_dir):
+                return f"❌ Dépôt introuvable: {safe}"
+
+            # Security: ensure path is within repo
+            full_path = os.path.realpath(os.path.join(repo_dir, path))
+            repo_real = os.path.realpath(repo_dir)
+            if not (full_path == repo_real or full_path.startswith(repo_real + os.sep)):
+                return "❌ Chemin refusé (hors dépôt)."
+
+            if not os.path.isfile(full_path):
+                return f"❌ Fichier introuvable: {path}"
+
+            # Check if binary file
+            try:
+                with open(full_path, "rb") as f:
+                    head = f.read(4096)
+                    if self._looks_binary(head):
+                        return "❌ Fichier binaire / non texte."
+            except Exception:
+                return "❌ Erreur lecture fichier."
+
+            # Clamp max_items
+            max_items = max(1, min(max_items, 1000))
+            if max_items > 200:
+                max_items = 200
+
+            # Get file size
+            file_size = os.path.getsize(full_path)
+
+            # Parse file for declarations
+            items = []
+            current_class = None
+            indentation_level = 0
+
+            try:
+                with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    for line_num, line in enumerate(f, 1):
+                        original_line = line
+                        stripped = line.strip()
+
+                        if not stripped or stripped.startswith('#'):
+                            continue
+
+                        # Detect indentation (for Python class methods)
+                        leading_spaces = len(line) - len(line.lstrip())
+
+                        # Python patterns
+                        # Class definition
+                        class_match = re.match(r'^\s*class\s+(\w+)', line)
+                        if class_match:
+                            class_name = class_match.group(1)
+                            current_class = class_name
+                            indentation_level = leading_spaces
+                            items.append({
+                                'line': line_num,
+                                'kind': 'class',
+                                'name': class_name,
+                                'full_name': class_name
+                            })
+                            continue
+
+                        # Function definition
+                        func_match = re.match(r'^\s*(async\s+)?def\s+(\w+)', line)
+                        if func_match:
+                            func_name = func_match.group(2)
+                            # Check if it's a method (indented under a class)
+                            if current_class and leading_spaces > indentation_level:
+                                full_name = f"{current_class}.{func_name}"
+                                kind = 'method'
+                            else:
+                                full_name = func_name
+                                kind = 'function'
+                                current_class = None  # Reset class context
+
+                            items.append({
+                                'line': line_num,
+                                'kind': kind,
+                                'name': func_name,
+                                'full_name': full_name
+                            })
+                            continue
+
+                        # JavaScript/TypeScript patterns
+                        # Function declaration
+                        js_func_match = re.match(r'^\s*function\s+(\w+)', line)
+                        if js_func_match:
+                            func_name = js_func_match.group(1)
+                            items.append({
+                                'line': line_num,
+                                'kind': 'function',
+                                'name': func_name,
+                                'full_name': func_name
+                            })
+                            continue
+
+                        # Const function (arrow function)
+                        const_func_match = re.match(r'^\s*const\s+(\w+)\s*=\s*(?:async\s+)?\(.*?\)\s*=>', line)
+                        if const_func_match:
+                            func_name = const_func_match.group(1)
+                            items.append({
+                                'line': line_num,
+                                'kind': 'function',
+                                'name': func_name,
+                                'full_name': func_name
+                            })
+                            continue
+
+                        # Class definition (JS/TS)
+                        js_class_match = re.match(r'^\s*class\s+(\w+)', line)
+                        if js_class_match:
+                            class_name = js_class_match.group(1)
+                            current_class = class_name
+                            items.append({
+                                'line': line_num,
+                                'kind': 'class',
+                                'name': class_name,
+                                'full_name': class_name
+                            })
+                            continue
+
+                        # Method definition (JS/TS) - simplified
+                        method_match = re.match(r'^\s*(\w+)\s*\(.*?\)\s*{', line)
+                        if method_match and current_class and leading_spaces > 0:
+                            method_name = method_match.group(1)
+                            # Skip common non-methods
+                            if method_name not in ['if', 'for', 'while', 'switch', 'try']:
+                                items.append({
+                                    'line': line_num,
+                                    'kind': 'method',
+                                    'name': method_name,
+                                    'full_name': f"{current_class}.{method_name}"
+                                })
+
+                        # Reset class context if we're back at top level
+                        if current_class and leading_spaces == 0 and stripped and not stripped.startswith(('}', '//')):
+                            current_class = None
+
+            except Exception as e:
+                return f"❌ Erreur parsing fichier: {e}"
+
+            # Remove duplicates while preserving order
+            seen = set()
+            unique_items = []
+            for item in items:
+                key = (item['line'], item['kind'], item['full_name'])
+                if key not in seen:
+                    seen.add(key)
+                    unique_items.append(item)
+
+            # Apply limit
+            displayed_items = unique_items[:max_items]
+            truncated = len(unique_items) > max_items
+
+            # Build output
+            lines = [
+                f"## Outline — {safe}/{path}",
+                f"**Taille**: {file_size} octets",
+                f"**Items**: {len(displayed_items)}/{len(unique_items)}",
+                "",
+            ]
+
+            if not displayed_items:
+                lines.append("ℹ️ Aucune déclaration détectée (fonction, classe).")
+            else:
+                lines.append("### Déclarations")
+                for item in displayed_items:
+                    kind_icon = {
+                        'class': '🏛️',
+                        'function': '⚡',
+                        'method': '🔧'
+                    }.get(item['kind'], '📄')
+
+                    lines.append(f"- {item['line']:4d} · {kind_icon} {item['kind']} · **{item['full_name']}**")
+
+            if truncated:
+                lines.extend([
+                    "",
+                    f"… (troncature à {max_items} items)"
+                ])
+
+            self.logger.info("[OUTLINE] %s/%s: %d items (%d total), %d bytes",
+                           safe, path, len(displayed_items), len(unique_items), file_size)
+
+            return "\n".join(lines)
+
+        except Exception as e:
+            self.logger.error("[OUTLINE] outline_file error: %s", e)
+            return f"❌ Erreur outline_file: {e}"
+
+    def find_tests_for(self, repo_name: str, target: str, max_results: int = 50) -> str:
+        """
+        Find tests related to a symbol or file quickly.
+
+        Args:
+            repo_name: Repository name (sanitized)
+            target: Symbol name or relative file path
+            max_results: Maximum results (1-500, clamped to 50)
+
+        Returns:
+            Formatted markdown with test candidates sorted by relevance
+        """
+        try:
+            p = self._paths()
+            safe = self._sanitize_repo_name(repo_name)
+            repo_dir = os.path.join(p["repos"], safe)
+
+            if not os.path.isdir(repo_dir):
+                return f"❌ Dépôt introuvable: {safe}"
+
+            # Clamp max_results
+            max_results = max(1, min(max_results, 500))
+            if max_results > 50:
+                max_results = 50
+
+            # Determine if target is a file path or symbol
+            is_file = '/' in target or '.' in target
+            candidates = []
+
+            # Get all files for searching
+            files = self._get_repo_files_for_search(repo_dir)
+
+            # Filter to test files only
+            test_files = []
+            for file_info in files:
+                file_path = file_info['path'].lower()
+                if any(marker in file_path for marker in [
+                    'test', 'spec', '__tests__', 'tests/',
+                    '.test.', '_test.', '.spec.'
+                ]):
+                    test_files.append(file_info)
+
+            if not test_files:
+                return f"ℹ️ Aucun fichier de test trouvé dans {safe}."
+
+            # Load index if available for symbol lookup
+            index = self._load_or_create_index(safe)
+
+            if is_file:
+                # Target is a file path
+                target_basename = os.path.splitext(os.path.basename(target))[0]
+                target_module = target.replace('/', '.').replace('.py', '').replace('.js', '').replace('.ts', '')
+
+                for file_info in test_files:
+                    score = 0
+                    reasons = []
+
+                    try:
+                        with open(file_info['full_path'], 'r', encoding='utf-8', errors='ignore') as f:
+                            content = f.read()
+
+                        # Check for direct import of the module
+                        import_patterns = [
+                            rf'from\s+{re.escape(target_module)}\s+import',
+                            rf'import\s+{re.escape(target_module)}',
+                            rf'from\s+.*{re.escape(target_basename)}\s+import',
+                            rf'require\s*\(\s*[\'\"]{re.escape(target)}[\'\"]',
+                            rf'import\s+.*from\s+[\'\"]{re.escape(target)}[\'\"]'
+                        ]
+
+                        for pattern in import_patterns:
+                            if re.search(pattern, content, re.IGNORECASE):
+                                score += 3
+                                reasons.append('import')
+                                break
+
+                        # Check for basename in test file name
+                        test_filename = os.path.basename(file_info['path']).lower()
+                        if target_basename.lower() in test_filename:
+                            score += 1
+                            reasons.append('name')
+
+                        # Check for path proximity (same directory tree)
+                        target_dir = os.path.dirname(target)
+                        test_dir = os.path.dirname(file_info['path'])
+                        if target_dir and test_dir and target_dir in test_dir:
+                            score += 1
+                            reasons.append('proximity')
+
+                        if score > 0:
+                            candidates.append({
+                                'file': file_info['path'],
+                                'score': score,
+                                'reasons': reasons,
+                                'content': content
+                            })
+
+                    except Exception:
+                        continue
+
+            else:
+                # Target is a symbol
+                symbol_files = set()
+
+                # Find where symbol is defined
+                if index:
+                    for func in index.get("functions", []):
+                        if func["name"] == target:
+                            symbol_files.add(func["file"])
+                    for cls in index.get("classes", []):
+                        if cls["name"] == target:
+                            symbol_files.add(cls["file"])
+
+                for file_info in test_files:
+                    score = 0
+                    reasons = []
+
+                    try:
+                        with open(file_info['full_path'], 'r', encoding='utf-8', errors='ignore') as f:
+                            content = f.read()
+
+                        # Check for direct usage of symbol
+                        usage_pattern = rf'\b{re.escape(target)}\s*\('
+                        if re.search(usage_pattern, content):
+                            score += 2
+                            reasons.append('usage')
+
+                        # Check for import from symbol's file
+                        for symbol_file in symbol_files:
+                            module_name = os.path.splitext(symbol_file)[0].replace('/', '.')
+                            import_pattern = rf'from\s+{re.escape(module_name)}\s+import.*{re.escape(target)}'
+                            if re.search(import_pattern, content):
+                                score += 3
+                                reasons.append('import')
+                                break
+
+                        # Check for name matching in test file
+                        test_filename = os.path.basename(file_info['path']).lower()
+                        if target.lower() in test_filename:
+                            score += 1
+                            reasons.append('name')
+
+                        if score > 0:
+                            candidates.append({
+                                'file': file_info['path'],
+                                'score': score,
+                                'reasons': reasons,
+                                'content': content
+                            })
+
+                    except Exception:
+                        continue
+
+            # Sort by score descending
+            candidates.sort(key=lambda x: x['score'], reverse=True)
+            candidates = candidates[:max_results]
+
+            # Build output
+            lines = [
+                f"## Tests liés — {target} (repo={safe})",
+                "",
+            ]
+
+            if not candidates:
+                lines.extend([
+                    f"ℹ️ Aucun test trouvé pour « {target} ».",
+                    "Essayez: élargir patterns, vérifier nommage fichiers test, ou utiliser find_in_repo."
+                ])
+                return "\n".join(lines)
+
+            lines.append(f"### Candidats (N={len(candidates)})")
+            lines.append("")
+
+            # Show candidates with reasons
+            for candidate in candidates:
+                reason_str = '+'.join(candidate['reasons'])
+                lines.append(f"- **{candidate['score']}** · {candidate['file']} — raison: {reason_str}")
+
+            # Show extracts for top 3 candidates
+            if len(candidates) >= 1:
+                lines.extend(["", "### Extraits (top candidats)", ""])
+
+                for candidate in candidates[:3]:
+                    lines.append(f"#### {candidate['file']}")
+
+                    # Extract meaningful lines (test function names, assertions)
+                    content_lines = candidate['content'].split('\n')
+                    relevant_lines = []
+
+                    for i, line in enumerate(content_lines, 1):
+                        # Look for test functions, assertions, and target mentions
+                        if any(pattern in line.lower() for pattern in [
+                            'def test_', 'it(', 'describe(', 'test(', 'assert',
+                            target.lower(), 'expect'
+                        ]):
+                            context_start = max(0, i - 3)
+                            context_end = min(len(content_lines), i + 3)
+
+                            for j in range(context_start, context_end):
+                                if j < len(content_lines):
+                                    relevant_lines.append(f"{j+1:4d}: {content_lines[j]}")
+
+                            break  # Just show first relevant section
+
+                    if relevant_lines:
+                        lang = self._ext_lang_hint(candidate['file'])
+                        lines.append(f"```{lang}")
+                        lines.extend(relevant_lines[:20])  # Max 20 lines
+                        lines.append("```")
+                    else:
+                        lines.append("*(aucun extrait pertinent)*")
+
+                    lines.append("")
+
+            # Sources table
+            lines.extend([
+                "### Table des sources",
+                ""
+            ])
+
+            for candidate in candidates:
+                lines.append(f"- {candidate['file']} (score: {candidate['score']}, raisons: {'+'.join(candidate['reasons'])})")
+
+            self.logger.info("[TESTS] find_tests_for target='%s': %d candidates found",
+                           target, len(candidates))
+
+            return "\n".join(lines)
+
+        except Exception as e:
+            self.logger.error("[TESTS] find_tests_for error: %s", e)
+            return f"❌ Erreur find_tests_for: {e}"
+
+    def recent_changes(self, repo_name: str, days: int = 7, max_commits: int = 50) -> str:
+        """
+        Show recent git changes summary for quick debug/navigation context.
+
+        Args:
+            repo_name: Repository name (sanitized)
+            days: Time window in days (1-365, clamped to 7)
+            max_commits: Maximum commits (1-500, clamped to 50)
+
+        Returns:
+            Formatted markdown with recent commits and file change summary
+        """
+        try:
+            p = self._paths()
+            safe = self._sanitize_repo_name(repo_name)
+            repo_dir = os.path.join(p["repos"], safe)
+
+            if not os.path.isdir(repo_dir):
+                return f"❌ Dépôt introuvable: {safe}"
+
+            # Check if it's a git repository
+            git_dir = os.path.join(repo_dir, '.git')
+            if not os.path.exists(git_dir):
+                return "❌ Référentiel Git introuvable."
+
+            # Clamp parameters
+            days = max(1, min(days, 365))
+            max_commits = max(1, min(max_commits, 500))
+            if max_commits > 50:
+                max_commits = 50
+
+            # Build git log command
+            cmd = [
+                'git', 'log',
+                f'--since={days} days ago',
+                f'--max-count={max_commits}',
+                '--name-only',
+                '--pretty=format:%h%x09%ad%x09%an%x09%s',
+                '--date=short'
+            ]
+
+            self.logger.info("[RECENT] Running git log for %s (days=%d, max_commits=%d)",
+                           safe, days, max_commits)
+
+            # Execute git command
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    cwd=repo_dir,
+                    capture_output=True,
+                    text=True,
+                    timeout=float(self.valves.git_timeout_s),
+                    check=False
+                )
+
+                if proc.returncode != 0:
+                    stderr_truncated = (proc.stderr or "")[:200]
+                    return f"❌ Git log échoué (rc={proc.returncode}): {stderr_truncated}"
+
+                output = proc.stdout.strip()
+
+            except subprocess.TimeoutExpired:
+                return f"❌ Timeout git log après {self.valves.git_timeout_s}s"
+            except Exception as e:
+                return f"❌ Erreur exécution git: {e}"
+
+            if not output:
+                return f"ℹ️ Aucun commit dans les {days} derniers jours."
+
+            # Parse git log output
+            commits = []
+            file_changes = defaultdict(int)
+            current_commit = None
+
+            for line in output.split('\n'):
+                line = line.strip()
+                if not line:
+                    continue
+
+                # Check if it's a commit line (contains tabs)
+                if '\t' in line:
+                    parts = line.split('\t')
+                    if len(parts) >= 4:
+                        hash_short, date, author, subject = parts[0], parts[1], parts[2], parts[3]
+                        current_commit = {
+                            'hash': hash_short,
+                            'date': date,
+                            'author': author,
+                            'subject': subject,
+                            'files': []
+                        }
+                        commits.append(current_commit)
+                else:
+                    # It's a file name
+                    if current_commit is not None:
+                        current_commit['files'].append(line)
+                        file_changes[line] += 1
+
+            # Build output
+            lines = [
+                f"## Recent changes — {safe} (since {days}d, max {max_commits})",
+                f"**Commits**: {len(commits)}",
+                f"**Fichiers uniques**: {len(file_changes)}",
+                "",
+            ]
+
+            if commits:
+                lines.append("### Commits")
+                for commit in commits:
+                    file_count = len(commit['files'])
+                    file_preview = ', '.join(commit['files'][:3])
+                    if file_count > 3:
+                        file_preview += f", ... (+{file_count-3})"
+
+                    lines.append(f"- **{commit['hash']}** · {commit['date']} · {commit['author']} — {commit['subject']}")
+                    lines.append(f"  *(files: {file_count}) {file_preview}*")
+
+                lines.append("")
+
+            # Top modified files
+            if file_changes:
+                lines.append("### Top fichiers modifiés (fenêtre)")
+                top_files = sorted(file_changes.items(), key=lambda x: x[1], reverse=True)[:10]
+
+                for file_path, count in top_files:
+                    lines.append(f"- **{file_path}** · {count} commits")
+
+            self.logger.info("[RECENT] %s: %d commits, %d unique files in %dd window",
+                           safe, len(commits), len(file_changes), days)
+
+            return "\n".join(lines)
+
+        except Exception as e:
+            self.logger.error("[RECENT] recent_changes error: %s", e)
+            return f"❌ Erreur recent_changes: {e}"
+
 
 # =====================================================================
-# COMPLETION - v1.8 is ready!
+# COMPLETION - v1.9 is ready!
 # =====================================================================

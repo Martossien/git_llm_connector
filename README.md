@@ -531,6 +531,32 @@ gemini  # Choisir "Login with Google"
 
 ---
 
+## 🆕 Fonctions v1.9 (Developer UX)
+
+### `outline_file(repo_name, path, max_items=200)`
+**Navigation intelligente de gros fichiers**
+```python
+outline_file("my_project", "src/large_file.py", 100)
+# → Structure avec fonctions, classes, méthodes (ligne + type + nom)
+```
+
+### `find_tests_for(repo_name, target, max_results=50)`
+**Découverte de tests pour symbole ou fichier**
+```python
+find_tests_for("my_project", "authenticate")  # Pour une fonction
+find_tests_for("my_project", "src/auth.py")   # Pour un fichier
+# → Candidats triés par pertinence + extraits de code
+```
+
+### `recent_changes(repo_name, days=7, max_commits=50)`
+**Résumé git pour contexte de debug**
+```python
+recent_changes("my_project", 7, 20)
+# → Commits récents + fichiers les plus modifiés
+```
+
+---
+
 **💡 Conseil :** Commencez par cloner un petit projet familier, faites une analyse `depth="quick"`, et explorez les fonctionnalités avant de vous attaquer aux gros dépôts !
 
-*Pour support : consultez les logs détaillés dans `~/git_llm_connector/logs/` et vérifiez votre config LLM CLI avec `llm_check()`.*
+*Pour support : consultez les logs détaillés dans `~/git_llm_connector/logs/` et vérifiez votre config LLM CLI avec `llm_check()`. Voir aussi `docs/PLAYBOOKS_v1.9.md` pour les workflows optimaux.*
