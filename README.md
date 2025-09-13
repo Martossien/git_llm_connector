@@ -107,7 +107,8 @@ gemini
 
 1. **Nouvelle conversation** → **Cliquer sur le +** en haut
 2. **Activer "Git LLM Connector"** dans la liste des tools
-3. **Taper les commandes** directement dans la discussion
+3. **Donner le prompt du projet à la llm** pour qu'elle puisse utiliser les fonctions elle même et qu'elle vous aide
+4. **et/ou Taper les commandes** directement dans la discussion
 
 ## 🚀 Guide d'utilisation détaillé
 
