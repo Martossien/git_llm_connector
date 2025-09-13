@@ -1,4 +1,4 @@
-# 🚀 Git LLM Connector v1.6 - Tool Open WebUI (Expérimental)
+# 🚀 Git LLM Connector v1.9 - Tool Open WebUI (Expérimental)
 
 Un outil expérimental pour Open WebUI qui combine clonage Git, analyse de code par LLM CLI locaux, et exploration interactive des dépôts.
 
