@@ -11,6 +11,7 @@ An experimental tool that combines Git cloning with local LLM analysis to explor
 - **Search and explore code** with various strategies
 - **Extract context** for AI conversations about your code
 - **Navigate repositories** with specialized functions
+- **All fonction can be pilot by the llm** to help you to use this project
 
 **Key benefit**: Your code never leaves your machine - all analysis is done locally.
 
