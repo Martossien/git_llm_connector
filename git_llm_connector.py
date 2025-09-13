@@ -3,1681 +3,1321 @@ title: Git LLM Connector
 author: Martossien
 author_url: https://github.com/Martossien
 git_url: https://github.com/Martossien/git_llm_connector
-description: Tool Open WebUI pour cloner, analyser et résumer des dépôts Git à l'aide de LLM accessibles via les CLI Gemini ou Qwen.
+description: v1.6 safe — Lecture + Git + Analyse LLM via CLI (gemini/qwen). Contexte borné, logs détaillés, chemins stables, LLM timeout=900s.
 required_open_webui_version: 0.6.0
-version: 0.2.0
+version: 0.1.6
 license: MIT
 requirements: aiofiles,pathspec,pydantic
 """
 
-TOOL_VERSION = "0.2.0"
-
-from typing import Optional, Callable, Awaitable, Any, List, Dict, Union, Literal, Tuple
+from typing import Any, List, Dict
 from pydantic import BaseModel, Field
-import asyncio
-import aiofiles
 import os
+import logging
+from datetime import datetime
+import re
 import json
+import stat
+import pathspec
 import subprocess
 import shutil
-import glob
-import pathspec
-import logging
-import re
-from datetime import datetime
-from urllib.parse import urlparse
-from pathlib import Path
-import shlex
 import time
-import hashlib
+
+# -------------------------------------
+# UTILITAIRE LOCAL (petite redaction)
+# -------------------------------------
+_SECRET_PATTERNS = [
+    (re.compile(r"(?i)(API_KEY|SECRET|TOKEN|PASSWORD)\s*=\s*[^\s]+"), r"\1=****"),
+    (re.compile(r"ghp_[A-Za-z0-9]+"), "ghp_****"),
+    (re.compile(r"eyJ[\w-]+?\.[\w-]+?\.[\w-]+"), "****"),  # JWT grossier
+]
+
 
 class Tools:
     """
-    Git LLM Connector - Tool Open WebUI pour l'analyse intelligente de dépôts Git
-    
-    Ce tool permet de :
-    - Cloner et synchroniser des dépôts GitHub/GitLab
-    - Analyser automatiquement le code via des LLM CLI externes
-    - Générer des synthèses structurées (ARCHITECTURE.md, API_SUMMARY.md, etc.)
-    - Injecter intelligemment le contexte dans les conversations
-    
-    Architecture :
-    ~/OW_tools/
-    ├── git_llm_connector.py (ce fichier)
-    ├── git_repos/
-    │   └── {owner}_{repo}/
-    │       ├── docs_analysis/
-    │       │   ├── ARCHITECTURE.md
-    │       │   ├── API_SUMMARY.md
-    │       │   ├── CODE_MAP.md
-    │       │   └── analysis_metadata.json
-    │       └── [fichiers du repo]
-    ├── logs/
-    └── README.md
+    Git LLM Connector — v1.6 SAFE
+
+    ✅ Public (signatures simples):
+      - tool_health(dummy: str = "") -> str
+      - debug_status(message: str = "ping") -> str
+      - list_repos() -> str
+      - list_analyzed_repos() -> str
+      - repo_info(repo_name: str) -> str
+      - get_repo_context(repo_name: str, max_files: int = 3, max_chars_per_file: int = 2000) -> str
+      - scan_repo_files(repo_name: str, limit: int = 50, order: str = "size", ascending: bool = False) -> str
+      - preview_file(repo_name: str, relative_path: str, max_bytes: int = 65536) -> str
+      - stats_repo(repo_name: str, top_n: int = 10) -> str
+      - find_in_repo(repo_name: str, needle: str, use_regex: bool = False, max_matches: int = 50) -> str
+      - git_clone(repo_url: str, name: str = "") -> str
+      - git_update(repo_name: str, strategy: str = "pull") -> str
+      - clean_analysis(repo_name: str) -> str
+      - llm_check(llm: str = "", model: str = "") -> str
+      - analyze_repo(repo_name: str, sections: str = "architecture,api,codemap", depth: str = "", language: str = "", llm: str = "", model: str = "") -> str
     """
-    
+
+    # ------------------------------
+    # Valves (admin)
+    # ------------------------------
     class Valves(BaseModel):
-        """
-        Configuration globale du Git LLM Connector (niveau administrateur)
-        
-        Ces paramètres définissent le comportement par défaut du tool
-        et peuvent être ajustés par l'administrateur Open WebUI.
-        """
-        
         git_repos_path: str = Field(
-            default="~/OW_tools/git_repos",
-            description="Répertoire racine de stockage des dépôts Git clonés"
+            default="/home/user/git_llm_connector/git_repos",
+            description="Répertoire racine local pour les dépôts Git clonés.",
         )
-        
         default_timeout: int = Field(
-            default=300,
-            description="Timeout par défaut pour les opérations Git et LLM CLI (secondes)"
+            default=300, description="Timeout par défaut pour opérations basiques (s)."
         )
-        
         default_globs_include: str = Field(
             default="**/*.py,**/*.js,**/*.ts,**/*.jsx,**/*.tsx,**/*.vue,**/*.go,**/*.rs,**/*.java,**/*.cpp,**/*.c,**/*.h,**/*.md,**/*.txt,**/*.yml,**/*.yaml,**/*.json,**/*.toml,**/*.cfg,**/*.ini",
-            description="Patterns de fichiers à inclure par défaut dans l'analyse"
+            description="Patterns de fichiers à inclure (séparés par des virgules).",
         )
-        
         default_globs_exclude: str = Field(
             default="**/.git/**,**/node_modules/**,**/dist/**,**/build/**,**/__pycache__/**,**/target/**,**/.venv/**,**/venv/**,**/*.png,**/*.jpg,**/*.jpeg,**/*.gif,**/*.svg,**/*.ico,**/*.pdf,**/*.zip,**/*.tar.gz",
-            description="Patterns de fichiers à exclure par défaut de l'analyse"
+            description="Patterns de fichiers à exclure (séparés par des virgules).",
         )
-        
         max_file_size_kb: int = Field(
-            default=500,
-            description="Taille maximale des fichiers à analyser (Ko)"
+            default=500, description="Taille max lue par fichier (Ko) pour inclusion."
         )
-        
         enable_debug_logging: bool = Field(
-            default=True,
-            description="Activer les logs détaillés pour le débogage"
+            default=True, description="Activer les logs détaillés."
         )
-        
         supported_git_hosts: str = Field(
             default="github.com,gitlab.com",
-            description="Hôtes Git supportés (séparés par des virgules)"
+            description="Hôtes Git supportés (séparés par des virgules).",
         )
-
         max_context_bytes: int = Field(
             default=32 * 1024 * 1024,
-            description="Taille maximale du contexte envoyé au LLM (octets)"
+            description="Taille max de contexte (octets).",
         )
-
         max_bytes_per_file: int = Field(
             default=512 * 1024,
-            description="Taille maximale lue par fichier pour le contexte (octets)"
+            description="Octets max lus par fichier pour le contexte.",
         )
-
         extra_bin_dirs: str = Field(
             default="",
-            description="Chemins additionnels pour les binaires LLM (séparés par ':')"
+            description="Répertoires additionnels pour binaires LLM (séparés par ':').",
         )
-
         git_timeout_s: float = Field(
-            default=120.0,
-            description="Timeout pour les opérations Git (secondes)"
+            default=180.0, description="Timeout Git (secondes)."
         )
-
         llm_timeout_s: float = Field(
-            default=180.0,
-            description="Timeout pour les appels LLM CLI (secondes)"
+            default=900.0, description="Timeout appels LLM CLI (secondes)."
+        )
+        emit_citations: bool = Field(
+            default=True, description="Émettre des citations si supportées."
         )
 
+    # ------------------------------
+    # UserValves (utilisateur)
+    # ------------------------------
     class UserValves(BaseModel):
-        """
-        Configuration utilisateur du Git LLM Connector
-        
-        Ces paramètres permettent à chaque utilisateur de personnaliser
-        le comportement du tool selon ses préférences.
-        """
-        
         llm_cli_choice: str = Field(
-            default="qwen",
-            description="Choix du LLM CLI pour l'analyse (qwen, gemini, ou auto)"
+            default="qwen", description="LLM CLI (qwen / gemini / auto)."
         )
-        analysis_mode: Literal["smart", "full", "diff"] = Field(
-            default="smart",
-            description="Mode d'analyse (smart, full, diff)",
+        analysis_mode: str = Field(
+            default="smart", description="Mode d’analyse (réservé v2)."
         )
-
-        
         enable_auto_analysis: bool = Field(
-            default=True,
-            description="Activer l'analyse automatique par LLM CLI lors du clonage"
+            default=True, description="Analyse auto après clone (réservé v2)."
         )
-        
         max_context_files: int = Field(
-            default=10,
-            description="Nombre maximum de fichiers de synthèse à injecter dans le contexte"
+            default=10, description="Nb max de fichiers de synthèse à injecter."
         )
-        
         custom_globs_include: str = Field(
-            default="",
-            description="Patterns personnalisés de fichiers à inclure (laissez vide pour utiliser les défauts)"
+            default="", description="Patterns personnalisés à inclure."
         )
-        
         custom_globs_exclude: str = Field(
-            default="",
-            description="Patterns personnalisés de fichiers à exclure (laissez vide pour utiliser les défauts)"
+            default="", description="Patterns personnalisés à exclure."
         )
         focus_paths: str = Field(
-            default="",
-            description="Sous-chemins relatifs du dépôt à analyser (séparés par des virgules)",
+            default="", description="Chemins à prioriser (séparés par des virgules)."
         )
-        
         analysis_depth: str = Field(
-            default="standard",
-            description="Profondeur d'analyse (quick, standard, deep)"
+            default="standard", description="Profondeur (quick, standard, deep)."
         )
-        
         preferred_language: str = Field(
-            default="fr",
-            description="Langue préférée pour les synthèses générées (fr, en)"
+            default="fr", description="Langue préférée (fr/en)."
         )
-
         llm_bin_name: str = Field(
-            default="gemini",
-            description="Nom du binaire LLM à utiliser (gemini ou qwen)"
+            default="gemini", description="Binaire LLM (ex: gemini, qwen)."
         )
-
         llm_model_name: str = Field(
-            default="gemini-2.5-pro",
-            description="Nom du modèle LLM à utiliser"
+            default="gemini-2.5-pro", description="Nom du modèle LLM."
         )
-
         llm_cmd_template: str = Field(
             default="{bin} --model {model} --prompt {prompt}",
-            description="Gabarit de commande pour l'appel LLM CLI"
+            description="Template de commande LLM.",
         )
-
         prompt_style: str = Field(
             default="concise, structured, actionable",
-            description="Style de rédaction des synthèses",
+            description="Style des prompts (réservé v2).",
         )
         prompt_extra_architecture: str = Field(
-            default="",
-            description="Instructions additionnelles pour l'analyse d'architecture",
+            default="", description="Suffixe prompt ARCHITECTURE (v2)."
         )
         prompt_extra_api: str = Field(
-            default="",
-            description="Instructions additionnelles pour la synthèse API",
+            default="", description="Suffixe prompt API (v2)."
         )
         prompt_extra_codemap: str = Field(
-            default="",
-            description="Instructions additionnelles pour la carte du code",
+            default="", description="Suffixe prompt CODEMAP (v2)."
         )
 
+    # ------------------------------
+    # Init
+    # ------------------------------
     def __init__(self):
-        """
-        Initialise le Git LLM Connector
-        
-        Configure les valves, initialise le système de logging,
-        et prépare l'environnement de travail.
-        """
         self.valves = self.Valves()
         self.user_valves = self.UserValves()
-        self.citation = False  # Open WebUI gère automatiquement les citations
-        
-        # Initialisation du système de logging
+        self.citation = False
+
+        home = os.path.expanduser("~")
+        self.base_dir = os.path.join(home, "git_llm_connector")
+        self.logs_dir = os.path.join(self.base_dir, "logs")
+        self.repos_dir = os.path.join(self.base_dir, "git_repos")
+        os.makedirs(self.logs_dir, exist_ok=True)
+        os.makedirs(self.repos_dir, exist_ok=True)
+
+        # Forcer chemins et timeout
+        self.valves.git_repos_path = self.repos_dir
+        self.valves.llm_timeout_s = 900.0
+
         self._setup_logging()
-        
-        # Cache des métadonnées des repos analysés
-        self._repo_cache = {}
-        
-        # Patterns de prompts pour les différents LLM CLI
-        self._analysis_prompts = {
-            "architecture": {
-                "fr": "Analyse l'architecture de ce projet de code. Décris la stack technique utilisée, les modules principaux, les points d'entrée de l'application, l'organisation générale du code, et les patterns architecturaux identifiés. Sois concis mais complet.",
-                "en": "Analyze the architecture of this code project. Describe the technical stack used, main modules, application entry points, general code organization, and identified architectural patterns. Be concise but comprehensive."
-            },
-            "api": {
-                "fr": "Extrait et documente toutes les APIs, fonctions publiques, classes principales et leurs interfaces dans ce projet. Crée un résumé des points d'entrée programmatiques disponibles.",
-                "en": "Extract and document all APIs, public functions, main classes and their interfaces in this project. Create a summary of available programmatic entry points."
-            },
-            "codemap": {
-                "fr": "Crée une carte synthétique du code de ce projet : décris le rôle de chaque dossier principal, identifie les fichiers les plus importants, et explique les flux de données principaux. Aide-moi à naviguer efficacement dans ce codebase.",
-                "en": "Create a synthetic code map of this project: describe the role of each main folder, identify the most important files, and explain the main data flows. Help me navigate efficiently through this codebase."
-            }
-        }
-        
-        self.logger.info("Git LLM Connector initialisé avec succès")
-
-    def _setup_logging(self) -> None:
-        """
-        Configure le système de logging avancé
-        
-        Crée un logger personnalisé avec rotation des fichiers,
-        niveaux de verbosité configurables, et formatage structuré.
-        """
-        # Expansion du répertoire home et création du dossier logs
-        log_dir = os.path.expanduser("~/OW_tools/logs")
-        os.makedirs(log_dir, exist_ok=True)
-        
-        # Nom du fichier de log avec timestamp
-        log_file = os.path.join(
-            log_dir, 
-            f"git_llm_connector_{datetime.now().strftime('%Y%m%d')}.log"
+        self.logger.info(
+            "[INIT] v1.6 safe — base=%s, repos=%s, logs=%s, llm_timeout=%ss",
+            self.base_dir,
+            self.repos_dir,
+            self.logs_dir,
+            self.valves.llm_timeout_s,
         )
-        
-        # Configuration du logger principal
+
+    # ------------------------------
+    # Logging
+    # ------------------------------
+    def _setup_logging(self) -> None:
+        log_dir = getattr(
+            self,
+            "logs_dir",
+            os.path.join(os.path.expanduser("~"), "git_llm_connector", "logs"),
+        )
+        os.makedirs(log_dir, exist_ok=True)
+        log_file = os.path.join(
+            log_dir, f"git_llm_connector_{datetime.now().strftime('%Y%m%d')}.log"
+        )
+
         self.logger = logging.getLogger("GitLLMConnector")
-        self.logger.setLevel(logging.DEBUG if self.valves.enable_debug_logging else logging.INFO)
-        
-        # Éviter les handlers dupliqués
+        self.logger.setLevel(
+            logging.DEBUG if self.valves.enable_debug_logging else logging.INFO
+        )
+
         if not self.logger.handlers:
-            # Handler pour fichier avec rotation
-            file_handler = logging.FileHandler(log_file, encoding='utf-8')
-            file_handler.setLevel(logging.DEBUG)
-            
-            # Handler pour console (optionnel selon environnement)
-            console_handler = logging.StreamHandler()
-            console_handler.setLevel(logging.WARNING)
-            
-            # Formatage structuré des logs
-            formatter = logging.Formatter(
-                '%(asctime)s - %(name)s - %(levelname)s - [%(funcName)s:%(lineno)d] - %(message)s'
+            fh = logging.FileHandler(log_file, encoding="utf-8")
+            fh.setLevel(logging.DEBUG)
+            ch = logging.StreamHandler()
+            ch.setLevel(logging.WARNING)
+            fmt = logging.Formatter(
+                "%(asctime)s - %(name)s - %(levelname)s - [%(funcName)s:%(lineno)d] - %(message)s"
             )
-            file_handler.setFormatter(formatter)
-            console_handler.setFormatter(formatter)
-            
-            self.logger.addHandler(file_handler)
-            self.logger.addHandler(console_handler)
-        
-        self.logger.info(f"Système de logging configuré - Fichier: {log_file}")
+            fh.setFormatter(fmt)
+            ch.setFormatter(fmt)
+            self.logger.addHandler(fh)
+            self.logger.addHandler(ch)
 
-    async def analyze_repo(
-        self,
-        repo_url: str,
-        __event_emitter__: Optional[Callable[[dict], Awaitable[None]]] = None,
-        force: bool = False,
-        mode: Optional[str] = None,
-    ) -> str:
-        """
-        Fonction principale d'analyse d'un dépôt Git
+        self.logger.info("Système de logging configuré - Fichier: %s", log_file)
 
-        Cette fonction orchestre l'ensemble du processus :
-        1. Parse et validation de l'URL
-        2. Clone ou mise à jour du dépôt
-        3. Scan des fichiers selon les patterns
-        4. Analyse via LLM CLI externe
-        5. Génération des fichiers de synthèse
-        6. Injection dans le contexte
-        
-        Args:
-            repo_url (str): URL complète du dépôt Git (GitHub/GitLab)
-            __event_emitter__: Fonction d'émission d'événements Open WebUI
-            
-        Returns:
-            str: Résumé de l'analyse avec statistiques et contexte injecté
-            
-        Raises:
-            ValueError: Si l'URL est invalide ou non supportée
-            RuntimeError: Si l'analyse échoue
-        """
-        orig_mode = self.user_valves.analysis_mode
-        try:
-            self.logger.info(f"🚀 Démarrage analyse repo: {repo_url}")
-            
-            # Émission du statut de démarrage
-            if __event_emitter__:
-                await __event_emitter__({
-                    "type": "status",
-                    "data": {
-                        "description": "🔍 Analyse du dépôt Git en cours...",
-                        "done": False,
-                        "hidden": False
-                    }
-                })
-            
-            # 1. Parse et validation de l'URL
-            repo_info = await self._parse_git_url(repo_url)
-            self.logger.debug(f"Info repo parsée: {repo_info}")
-            
-            if __event_emitter__:
-                await __event_emitter__({
-                    "type": "status",
-                    "data": {
-                        "description": f"📥 Clonage de {repo_info['owner']}/{repo_info['repo']}...",
-                        "done": False,
-                        "hidden": False
-                    }
-                })
-            
-            # 2. Clone ou mise à jour du dépôt
-            local_path = await self._clone_or_update_repo(repo_info, __event_emitter__)
+    # ------------------------------
+    # Helpers
+    # ------------------------------
+    @staticmethod
+    def _paths():
+        home = os.path.expanduser("~")
+        base = os.path.join(home, "git_llm_connector")
+        return {
+            "base": base,
+            "repos": os.path.join(base, "git_repos"),
+            "logs": os.path.join(base, "logs"),
+        }
 
-            orig_mode = self.user_valves.analysis_mode
-            effective_mode = mode if mode else orig_mode
-            if force:
-                effective_mode = "full"
-            self.user_valves.analysis_mode = effective_mode
+    @staticmethod
+    def _sanitize_repo_name(name: str) -> str:
+        safe = re.sub(r"[^a-zA-Z0-9._-]", "_", name)
+        return safe.strip("._-") or "repo"
 
-            if __event_emitter__:
-                await __event_emitter__({
-                    "type": "status",
-                    "data": {
-                        "description": "📊 Scan des fichiers du projet...",
-                        "done": False,
-                        "hidden": False
-                    }
-                })
+    @staticmethod
+    def _ext_lang_hint(path: str) -> str:
+        ext = os.path.splitext(path)[1].lower()
+        return {
+            ".py": "python",
+            ".js": "javascript",
+            ".ts": "typescript",
+            ".tsx": "tsx",
+            ".jsx": "jsx",
+            ".json": "json",
+            ".yml": "yaml",
+            ".yaml": "yaml",
+            ".md": "markdown",
+            ".toml": "toml",
+            ".ini": "ini",
+            ".cfg": "ini",
+            ".go": "go",
+            ".rs": "rust",
+            ".java": "java",
+            ".c": "c",
+            ".h": "c",
+            ".cpp": "cpp",
+        }.get(ext, "")
 
-            # 3. Scan des fichiers selon les patterns
-            file_stats = await self._scan_repository_files(local_path)
-            self.logger.info(
-                f"Fichiers scannés: {file_stats['total_files']} fichiers, {file_stats['total_size_mb']:.1f} MB"
-            )
-
-            should_reanalyze, prev_meta = await self._should_reanalyze(
-                local_path, file_stats["files"], effective_mode, force
-            )
-
-            analysis_dir = os.path.join(local_path, "docs_analysis")
-            os.makedirs(analysis_dir, exist_ok=True)
-
-            synthesis_files: List[str] = []
-            llm_info: Dict[str, str] = prev_meta.get("llm", {}) if prev_meta else {}
-            synth_count = prev_meta.get("synthesis_count", 0) if prev_meta else 0
-
-            if self.user_valves.enable_auto_analysis and should_reanalyze:
-                if __event_emitter__:
-                    await __event_emitter__({
-                        "type": "status",
-                        "data": {
-                            "description": f"🤖 Analyse par {self.user_valves.llm_cli_choice.upper()}...",
-                            "done": False,
-                            "hidden": False,
-                        },
-                    })
-                synthesis_files, llm_info = await self._run_llm_analysis(
-                    local_path, repo_info, file_stats, prev_meta, __event_emitter__
-                )
-                synth_count = len(synthesis_files)
-            elif not should_reanalyze:
-                self.logger.info(
-                    "Aucun changement détecté, réutilisation des synthèses existantes"
-                )
-                if __event_emitter__:
-                    await __event_emitter__({
-                        "type": "status",
-                        "data": {
-                            "description": "⚡ Aucun changement détecté, réutilisation des synthèses existantes",
-                            "done": False,
-                            "hidden": False,
-                        },
-                    })
-                existing = [
-                    f
-                    for f in ["ARCHITECTURE.md", "API_SUMMARY.md", "CODE_MAP.md"]
-                    if os.path.exists(os.path.join(analysis_dir, f))
-                ]
-                synthesis_files = existing
-
-            await self._save_analysis_metadata(
-                local_path,
-                repo_info,
-                file_stats,
-                llm_info,
-                synth_count,
-                prev_meta if not should_reanalyze else None,
-            )
-
-            # 5. Injection du contexte
-            if __event_emitter__:
-                await __event_emitter__({
-                    "type": "status",
-                    "data": {
-                        "description": "📋 Injection du contexte...",
-                        "done": False,
-                        "hidden": False
-                    }
-                })
-
-            context_content = await self._inject_repository_context(
-                local_path, repo_info, synthesis_files, __event_emitter__
-            )
-            
-            # 6. Finalisation
-            if __event_emitter__:
-                await __event_emitter__({
-                    "type": "status",
-                    "data": {
-                        "description": "✅ Analyse terminée avec succès !",
-                        "done": True,
-                        "hidden": False
-                    }
-                })
-            
-            # Préparation du résumé final
-            llm_used = (
-                f"{llm_info.get('cli_name', 'N/A').upper()} ({llm_info.get('model', '')})"
-                if llm_info
-                else "N/A"
-            )
-            synth_display = f"{len(synthesis_files)} ({'générées' if should_reanalyze else 'réutilisées'})"
-            summary = f"""
-## 📊 Analyse du dépôt {repo_info['owner']}/{repo_info['repo']} terminée
-
-**Statistiques :**
-- 📁 Fichiers analysés : {file_stats['total_files']}
-- 📦 Taille totale : {file_stats['total_size_mb']:.1f} MB
-- 🗂️ Types de fichiers : {', '.join(file_stats['file_types'][:5])}
-- 🤖 LLM utilisé : {llm_used}
-- 📋 Synthèses : {synth_display}
-
-Le contexte du dépôt a été injecté et est maintenant disponible pour vos questions !
-"""
-            
-            self.logger.info(f"✅ Analyse terminée avec succès pour {repo_url}")
-            return summary
-            
-        except Exception as e:
-            msg = str(e)
-            if len(msg) > 200:
-                msg = msg[:200] + "..."
-            error_msg = f"❌ Erreur lors de l'analyse du dépôt: {msg}"
-            self.logger.error(f"Erreur analyse repo {repo_url}: {e}", exc_info=True)
-
-            if __event_emitter__:
-                await __event_emitter__({
-                    "type": "status",
-                    "data": {
-                        "description": error_msg,
-                        "done": True,
-                        "hidden": False
-                    }
-                })
-
-            return error_msg
-        finally:
-            self.user_valves.analysis_mode = orig_mode
-
-    async def sync_repo(
-        self,
-        repo_name: str,
-        __event_emitter__: Optional[Callable[[dict], Awaitable[None]]] = None,
-        force: bool = False,
-        mode: Optional[str] = None,
-    ) -> str:
-        """
-        Synchronise un dépôt déjà cloné
-        
-        Met à jour un dépôt existant et relance l'analyse si des changements
-        sont détectés. Optimisé pour les mises à jour incrémentales.
-        
-        Args:
-            repo_name (str): Nom du repo au format "owner_repo"
-            __event_emitter__: Fonction d'émission d'événements
-            
-        Returns:
-            str: Résultat de la synchronisation
-        """
-        orig_mode = self.user_valves.analysis_mode
-        try:
-            self.logger.info(f"🔄 Synchronisation repo: {repo_name}")
-            
-            if __event_emitter__:
-                await __event_emitter__({
-                    "type": "status",
-                    "data": {
-                        "description": f"🔄 Synchronisation de {repo_name}...",
-                        "done": False,
-                        "hidden": False
-                    }
-                })
-            
-            # Vérification existence du repo local
-            repos_path = os.path.expanduser(self.valves.git_repos_path)
-            repo_path = os.path.join(repos_path, repo_name)
-            
-            if not os.path.exists(repo_path):
-                raise ValueError(f"Dépôt {repo_name} non trouvé localement")
-            
-            await self._run_git_command(repo_path, ["pull", "origin"], __event_emitter__)
-
-            effective_mode = mode if mode else orig_mode
-            if force:
-                effective_mode = "full"
-            self.user_valves.analysis_mode = effective_mode
-
-            file_stats = await self._scan_repository_files(repo_path)
-            should_reanalyze, prev_meta = await self._should_reanalyze(
-                repo_path, file_stats["files"], effective_mode, force
-            )
-
-            repo_info = {
-                "owner": repo_name.split("_")[0],
-                "repo": "_".join(repo_name.split("_")[1:]),
-            }
-
-            llm_info = prev_meta.get("llm", {}) if prev_meta else {}
-            synth_count = prev_meta.get("synthesis_count", 0) if prev_meta else 0
-            synthesis_files: List[str] = []
-
-            if self.user_valves.enable_auto_analysis and should_reanalyze:
-                synthesis_files, llm_info = await self._run_llm_analysis(
-                    repo_path, repo_info, file_stats, prev_meta, __event_emitter__
-                )
-                synth_count = len(synthesis_files)
-                msg = f"✅ Dépôt {repo_name} synchronisé et ré-analysé ({len(synthesis_files)} synthèses mises à jour)"
-            else:
-                msg = f"✅ Dépôt {repo_name} déjà à jour"
-
-            await self._save_analysis_metadata(
-                repo_path,
-                repo_info,
-                file_stats,
-                llm_info,
-                synth_count,
-                prev_meta if not should_reanalyze else None,
-            )
-
-            if __event_emitter__:
-                await __event_emitter__({
-                    "type": "status",
-                    "data": {
-                        "description": msg,
-                        "done": True,
-                        "hidden": False,
-                    },
-                })
-
-            return msg
-
-        except Exception as e:
-            msg = str(e)
-            if len(msg) > 200:
-                msg = msg[:200] + "..."
-            error_msg = f"❌ Erreur synchronisation {repo_name}: {msg}"
-            self.logger.error(error_msg, exc_info=True)
-            
-            if __event_emitter__:
-                await __event_emitter__({
-                    "type": "status",
-                    "data": {
-                        "description": error_msg,
-                        "done": True,
-                        "hidden": False
-                    }
-                })
-            
-            return error_msg
-        finally:
-            self.user_valves.analysis_mode = orig_mode
-
-    async def list_analyzed_repos(
-        self,
-        __event_emitter__: Optional[Callable[[dict], Awaitable[None]]] = None
-    ) -> str:
-        """
-        Liste tous les dépôts analysés avec leurs métadonnées
-        
-        Parcourt le répertoire des dépôts et collecte les informations
-        sur chaque analyse effectuée.
-        
-        Returns:
-            str: Liste formatée des dépôts avec statistiques
-        """
-        try:
-            self.logger.info("📋 Listing des dépôts analysés")
-            
-            if __event_emitter__:
-                await __event_emitter__({
-                    "type": "status",
-                    "data": {
-                        "description": "📋 Collecte des informations des dépôts...",
-                        "done": False,
-                        "hidden": False
-                    }
-                })
-            
-            repos_path = os.path.expanduser(self.valves.git_repos_path)
-            
-            if not os.path.exists(repos_path):
-                return "📁 Aucun dépôt analysé pour le moment"
-            
-            repos = []
-            for item in os.listdir(repos_path):
-                repo_path = os.path.join(repos_path, item)
-                if os.path.isdir(repo_path):
-                    metadata = await self._get_repo_metadata(repo_path)
-                    repos.append({
-                        "name": item,
-                        "path": repo_path,
-                        "metadata": metadata
-                    })
-            
-            if not repos:
-                return "📁 Aucun dépôt analysé pour le moment"
-            
-            # Formatage de la liste
-            result = f"## 📋 Dépôts Git analysés ({len(repos)} total)\n\n"
-            
-            for repo in sorted(repos, key=lambda x: x['metadata'].get('last_analysis', '')):
-                meta = repo['metadata']
-                result += f"### 📦 {repo['name']}\n"
-                result += f"- 🕒 Dernière analyse : {meta.get('last_analysis', 'Non disponible')}\n"
-                result += f"- 📁 Fichiers : {meta.get('file_count', 'N/A')}\n"
-                result += f"- 💾 Taille : {meta.get('total_size_mb', 'N/A')} MB\n"
-                result += f"- 🤖 LLM : {meta.get('llm_used', 'N/A')}\n"
-                result += f"- 📋 Synthèses : {meta.get('synthesis_count', 0)}\n\n"
-            
-            if __event_emitter__:
-                await __event_emitter__({
-                    "type": "status",
-                    "data": {
-                        "description": "✅ Liste générée avec succès",
-                        "done": True,
-                        "hidden": False
-                    }
-                })
-            
-            return result
-            
-        except Exception as e:
-            error_msg = f"❌ Erreur listing repos: {str(e)}"
-            self.logger.error(error_msg, exc_info=True)
-            return error_msg
-
-    async def get_repo_context(
-        self,
-        repo_name: str,
-        __event_emitter__: Optional[Callable[[dict], Awaitable[None]]] = None
-    ) -> str:
-        """
-        Récupère et injecte le contexte d'un dépôt spécifique
-        
-        Charge les fichiers de synthèse d'un dépôt déjà analysé
-        et les injecte dans le contexte de la conversation.
-        
-        Args:
-            repo_name (str): Nom du repo au format "owner_repo"
-            
-        Returns:
-            str: Contexte injecté ou message d'erreur
-        """
-        try:
-            self.logger.info(f"📋 Récupération contexte pour: {repo_name}")
-            
-            if __event_emitter__:
-                await __event_emitter__({
-                    "type": "status",
-                    "data": {
-                        "description": f"📋 Chargement du contexte de {repo_name}...",
-                        "done": False,
-                        "hidden": False
-                    }
-                })
-            
-            repos_path = os.path.expanduser(self.valves.git_repos_path)
-            repo_path = os.path.join(repos_path, repo_name)
-            analysis_path = os.path.join(repo_path, "docs_analysis")
-            
-            if not os.path.exists(analysis_path):
-                return f"❌ Aucune analyse trouvée pour {repo_name}. Lancez d'abord analyze_repo()."
-            
-            # Chargement des fichiers de synthèse
-            synthesis_files = []
-            for filename in ["ARCHITECTURE.md", "API_SUMMARY.md", "CODE_MAP.md"]:
-                file_path = os.path.join(analysis_path, filename)
-                if os.path.exists(file_path):
-                    async with aiofiles.open(file_path, 'r', encoding='utf-8') as f:
-                        content = await f.read()
-                        synthesis_files.append({
-                            "name": filename,
-                            "content": content
-                        })
-            
-            # Injection du contexte via citations
-            if synthesis_files and __event_emitter__:
-                for syn_file in synthesis_files:
-                    await __event_emitter__({
-                        "type": "citation",
-                        "data": {
-                            "document": [syn_file["content"]],
-                            "metadata": [{"source": f"{repo_name}/{syn_file['name']}", "html": False}],
-                            "source": {"name": f"{repo_name} - {syn_file['name']}"}
-                        }
-                    })
-            
-            if __event_emitter__:
-                await __event_emitter__({
-                    "type": "status",
-                    "data": {
-                        "description": "✅ Contexte injecté avec succès",
-                        "done": True,
-                        "hidden": False
-                    }
-                })
-            
-            return f"✅ Contexte de {repo_name} chargé ({len(synthesis_files)} fichiers de synthèse injectés)"
-            
-        except Exception as e:
-            error_msg = f"❌ Erreur chargement contexte {repo_name}: {str(e)}"
-            self.logger.error(error_msg, exc_info=True)
-            return error_msg
-
-    async def _parse_git_url(self, url: str) -> Dict[str, str]:
-        """
-        Parse et valide une URL Git
-        
-        Extrait les informations owner/repo d'une URL GitHub/GitLab
-        et valide que l'hôte est supporté.
-        
-        Args:
-            url (str): URL du dépôt Git
-            
-        Returns:
-            Dict contenant owner, repo, host, et url_clean
-            
-        Raises:
-            ValueError: Si l'URL est invalide ou non supportée
-        """
-        try:
-            # Nettoyage de l'URL
-            url_clean = url.strip().rstrip('/')
-            
-            # Support des URLs avec ou sans protocole
-            if not url_clean.startswith(('http://', 'https://', 'git@')):
-                url_clean = f"https://{url_clean}"
-            
-            # Parse de l'URL
-            if url_clean.startswith('git@'):
-                # Format SSH: git@host:owner/repo.git
-                match = re.match(r'git@([^:]+):([^/]+)/([^/]+?)(?:\.git)?$', url_clean)
-                if not match:
-                    raise ValueError("Format SSH invalide")
-                host, owner, repo = match.groups()
-                url_clean = f"https://{host}/{owner}/{repo}"
-            else:
-                # Format HTTPS
-                parsed = urlparse(url_clean)
-                host = parsed.netloc
-                path_parts = [p for p in parsed.path.split('/') if p]
-                
-                if len(path_parts) < 2:
-                    raise ValueError("URL doit contenir owner/repo")
-                
-                owner, repo = path_parts[0], path_parts[1]
-                
-                # Suppression du .git si présent
-                if repo.endswith('.git'):
-                    repo = repo[:-4]
-            
-            # Validation de l'hôte
-            supported_hosts = [h.strip() for h in self.valves.supported_git_hosts.split(',')]
-            if host not in supported_hosts:
-                raise ValueError(f"Hôte {host} non supporté. Hôtes supportés: {', '.join(supported_hosts)}")
-            
-            result = {
-                "owner": owner,
-                "repo": repo,
-                "host": host,
-                "url_clean": url_clean,
-                "repo_name": f"{owner}_{repo}"
-            }
-            
-            self.logger.debug(f"URL parsée: {result}")
-            return result
-            
-        except Exception as e:
-            raise ValueError(f"URL Git invalide '{url}': {str(e)}")
-
-    async def _clone_or_update_repo(
-        self, 
-        repo_info: Dict[str, str],
-        __event_emitter__: Optional[Callable[[dict], Awaitable[None]]] = None
-    ) -> str:
-        """
-        Clone un nouveau dépôt ou met à jour un existant
-        
-        Args:
-            repo_info (Dict): Informations du dépôt (résultat de _parse_git_url)
-            __event_emitter__: Fonction d'émission d'événements
-            
-        Returns:
-            str: Chemin local du dépôt
-            
-        Raises:
-            RuntimeError: Si l'opération Git échoue
-        """
-        try:
-            repos_path = os.path.expanduser(self.valves.git_repos_path)
-            os.makedirs(repos_path, exist_ok=True)
-            
-            local_path = os.path.join(repos_path, repo_info["repo_name"])
-            
-            if os.path.exists(local_path):
-                self.logger.info(f"Mise à jour repo existant: {local_path}")
-                # Mise à jour
-                await self._run_git_command(local_path, ["fetch", "origin"], __event_emitter__)
-                await self._run_git_command(local_path, ["reset", "--hard", "origin/HEAD"], __event_emitter__)
-            else:
-                self.logger.info(f"Clonage nouveau repo: {repo_info['url_clean']} -> {local_path}")
-                # Clone
-                await self._run_git_command(
-                    repos_path, 
-                    ["clone", repo_info["url_clean"], repo_info["repo_name"]], 
-                    __event_emitter__
-                )
-            
-            return local_path
-            
-        except Exception as e:
-            raise RuntimeError(f"Échec clone/update repo: {str(e)}")
-
-    async def _run_git_command(
-        self, 
-        cwd: str, 
-        cmd: List[str],
-        __event_emitter__: Optional[Callable[[dict], Awaitable[None]]] = None
-    ) -> str:
-        """
-        Exécute une commande Git de manière asynchrone
-        
-        Args:
-            cwd (str): Répertoire de travail
-            cmd (List[str]): Commande Git à exécuter
-            __event_emitter__: Fonction d'émission d'événements
-            
-        Returns:
-            str: Sortie de la commande
-            
-        Raises:
-            RuntimeError: Si la commande échoue
-        """
-        try:
-            full_cmd = ["git"] + cmd
-            self.logger.debug(f"Exécution commande Git: {' '.join(full_cmd)} dans {cwd}")
-            
-            process = await asyncio.create_subprocess_exec(
-                *full_cmd,
-                cwd=cwd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(), 
-                timeout=self.valves.default_timeout
-            )
-            
-            if process.returncode != 0:
-                error_output = stderr.decode('utf-8')
-                raise RuntimeError(f"Commande Git échouée: {error_output}")
-            
-            result = stdout.decode('utf-8')
-            self.logger.debug(f"Résultat Git: {result[:200]}...")
-            return result
-            
-        except asyncio.TimeoutError:
-            raise RuntimeError(f"Timeout commande Git après {self.valves.default_timeout}s")
-        except Exception as e:
-            raise RuntimeError(f"Erreur exécution Git: {str(e)}")
-
-    async def _git_head(self, repo_path: str) -> str:
-        out = await self._run_git_command(repo_path, ["rev-parse", "HEAD"])
-        return out.strip()
-
-    def _is_binary_file(self, path: str) -> bool:
-        try:
-            with open(path, "rb") as f:
-                sample = f.read(2048)
-            if b"\0" in sample:
-                return True
-            try:
-                sample.decode("utf-8")
-                return False
-            except UnicodeDecodeError:
-                return True
-        except Exception:
+    @staticmethod
+    def _looks_binary(head: bytes) -> bool:
+        if b"\x00" in head:
             return True
+        nontext = sum(1 for b in head if b < 9 or (13 < b < 32) or b > 126)
+        return (len(head) > 0) and (nontext / len(head) > 0.30)
 
-    def _compute_file_sha256(self, abs_path: str, cap_bytes: int) -> str:
-        h = hashlib.sha256()
-        with open(abs_path, "rb") as f:
-            h.update(f.read(cap_bytes))
-        return h.hexdigest()
+    @staticmethod
+    def _build_specs(includes: List[str], excludes: List[str]):
+        inc = pathspec.PathSpec.from_lines(
+            "gitwildmatch", [p.strip() for p in includes if p.strip()]
+        )
+        exc = pathspec.PathSpec.from_lines(
+            "gitwildmatch", [p.strip() for p in excludes if p.strip()]
+        )
+        return inc, exc
 
-    async def _load_metadata(self, repo_path: str) -> Optional[dict]:
-        meta_path = os.path.join(repo_path, "docs_analysis", "analysis_metadata.json")
-        if not os.path.exists(meta_path):
-            return None
+    @staticmethod
+    def _parse_git_url(url: str) -> Dict[str, str]:
+        url = url.strip()
+        m = re.match(r"^git@([^:]+):([^/]+)/([^/]+?)(?:\.git)?$", url)
+        if m:
+            host, owner, repo = m.group(1), m.group(2), m.group(3)
+        else:
+            m = re.match(r"^https?://([^/]+)/([^/]+)/([^/]+?)(?:\.git)?/?$", url)
+            if not m:
+                raise ValueError("URL Git invalide")
+            host, owner, repo = m.group(1), m.group(2), m.group(3)
+        repo = repo[:-4] if repo.endswith(".git") else repo
+        return {
+            "host": host,
+            "owner": owner,
+            "repo": repo,
+            "repo_name": f"{owner}_{repo}",
+            "url_clean": f"https://{host}/{owner}/{repo}",
+        }
+
+    @staticmethod
+    def _redact_secrets(text: str) -> str:
         try:
-            async with aiofiles.open(meta_path, "r", encoding="utf-8") as f:
-                return json.loads(await f.read())
+            for pat, repl in _SECRET_PATTERNS:
+                text = pat.sub(repl, text)
+            return text
         except Exception:
-            return None
+            return text
 
-    async def _should_reanalyze(
-        self,
-        repo_path: str,
-        scanned_files: List[Dict[str, Any]],
-        mode: str,
-        force: bool = False,
-    ) -> Tuple[bool, dict]:
-        """Détermine si une ré-analyse est nécessaire."""
-        if force or mode == "full":
-            prev = await self._load_metadata(repo_path)
-            return True, prev or {}
-
-        prev = await self._load_metadata(repo_path)
-        if not prev:
-            return True, {}
-        try:
-            current_head = await self._git_head(repo_path)
-        except Exception:
-            return True, prev
-        if prev.get("repo_head_commit") and prev["repo_head_commit"] != current_head:
-            return True, prev
-        if mode in ("smart", "diff"):
-            cap = self.valves.max_bytes_per_file
-            prev_map = {f["path"]: f.get("sha256") for f in prev.get("files", [])}
-            for f in scanned_files:
-                cur_sha = f.get("sha256")
-                if not cur_sha:
-                    abs_p = os.path.join(repo_path, f["path"])
-                    try:
-                        cur_sha = self._compute_file_sha256(abs_p, cap)
-                    except Exception:
-                        return True, prev
-                if prev_map.get(f["path"]) != cur_sha:
-                    return True, prev
-            return False, prev
-        return True, prev
-
-    async def _scan_repository_files(self, repo_path: str) -> Dict[str, Any]:
-        """
-        Scan les fichiers du dépôt selon les patterns configurés
-        
-        Args:
-            repo_path (str): Chemin du dépôt local
-            
-        Returns:
-            Dict avec statistiques des fichiers scannés
-        """
-        try:
-            self.logger.info(f"Scan fichiers repo: {repo_path}")
-            
-            # Détermination des patterns à utiliser
-            include_patterns = (
-                self.user_valves.custom_globs_include
-                if self.user_valves.custom_globs_include
-                else self.valves.default_globs_include
-            ).split(',')
-
-            exclude_patterns = (
-                self.user_valves.custom_globs_exclude
-                if self.user_valves.custom_globs_exclude
-                else self.valves.default_globs_exclude
-            ).split(',')
-            
-            # Création des specs pathspec
-            include_spec = pathspec.PathSpec.from_lines('gitwildmatch', include_patterns)
-            exclude_spec = pathspec.PathSpec.from_lines('gitwildmatch', exclude_patterns)
-
-            files_found: List[Dict[str, Any]] = []
-            total_size = 0
-            file_types = set()
-
-            focus_paths = [p.strip().strip('/\\') for p in self.user_valves.focus_paths.split(',') if p.strip()]
-            roots = [repo_path] if not focus_paths else []
-            for fp in focus_paths:
-                abs_fp = os.path.join(repo_path, fp)
-                if os.path.isdir(abs_fp):
-                    roots.append(abs_fp)
-            if not roots:
-                roots = [repo_path]
-
-            cap = self.valves.max_bytes_per_file
-
-            for base in roots:
-                for root, dirs, files in os.walk(base):
-                    dirs[:] = [
-                        d
-                        for d in dirs
-                        if not exclude_spec.match_file(os.path.relpath(os.path.join(root, d), repo_path))
-                    ]
-
-                    for file in files:
-                        file_path = os.path.join(root, file)
-                        rel_path = os.path.relpath(file_path, repo_path)
-
-                        if include_spec.match_file(rel_path) and not exclude_spec.match_file(rel_path):
-                            try:
-                                file_stat = os.stat(file_path)
-                                file_size = file_stat.st_size
-                                if file_size <= self.valves.max_file_size_kb * 1024:
-                                    try:
-                                        sha = self._compute_file_sha256(file_path, cap)
-                                    except Exception:
-                                        sha = ""
-                                    files_found.append({
-                                        "path": rel_path,
-                                        "size": file_size,
-                                        "ext": os.path.splitext(file)[1].lower(),
-                                        "sha256": sha,
-                                    })
-                                    total_size += file_size
-                                    ext = os.path.splitext(file)[1].lower()
-                                    if ext:
-                                        file_types.add(ext[1:])
-                            except OSError:
-                                continue
-            
-            stats = {
-                "total_files": len(files_found),
-                "total_size_bytes": total_size,
-                "total_size_mb": total_size / (1024 * 1024),
-                "file_types": sorted(list(file_types)),
-                "files": files_found,
-                "include_patterns": include_patterns,
-                "exclude_patterns": exclude_patterns,
-            }
-            
-            self.logger.info(f"Scan terminé: {stats['total_files']} fichiers, {stats['total_size_mb']:.1f} MB")
-            return stats
-            
-        except Exception as e:
-            self.logger.error(f"Erreur scan fichiers: {e}", exc_info=True)
-            raise RuntimeError(f"Échec scan fichiers: {str(e)}")
-
-    async def _run_llm_analysis(
-        self,
-        repo_path: str,
-        repo_info: Dict[str, str],
-        file_stats: Dict[str, Any],
-        prev_metadata: Optional[dict],
-        __event_emitter__: Optional[Callable[[dict], Awaitable[None]]] = None,
-    ) -> Tuple[List[str], Dict[str, str]]:
-        """Exécute l'analyse LLM et retourne les fichiers générés et info LLM."""
-        try:
-            self.logger.info(f"Analyse LLM du repo: {repo_path}")
-
-            analysis_dir = os.path.join(repo_path, "docs_analysis")
-            os.makedirs(analysis_dir, exist_ok=True)
-
-            llm_cli = await self._get_available_llm_cli()
-            if not llm_cli:
-                self.logger.warning("Aucun LLM CLI disponible, analyse ignorée")
-                return [], {}
-
-            bin_name = (
-                self.user_valves.llm_bin_name
-                if llm_cli == self.user_valves.llm_cli_choice.lower()
-                else llm_cli
-            )
-            bin_path = self._resolve_executable(bin_name)
-            if not bin_path:
-                msg = f"Binaire LLM introuvable: {bin_name}"
-                self.logger.error(msg)
-                if __event_emitter__:
-                    await __event_emitter__({
-                        "type": "status",
-                        "data": {"description": msg[:200], "done": True, "hidden": False},
-                    })
-                return [], {}
-            self.logger.info(f"Binaire LLM utilisé: {bin_path}")
-
-            code_context, changed_count = await self._prepare_code_context(
-                repo_path, file_stats, prev_metadata
-            )
-            if (
-                self.user_valves.analysis_mode == "diff"
-                and changed_count == 0
-                and __event_emitter__
-            ):
-                await __event_emitter__({
-                    "type": "status",
-                    "data": {
-                        "description": "Aucun fichier modifié détecté, contexte limité aux fichiers prioritaires",
-                        "done": False,
-                        "hidden": False,
-                    },
-                })
-
-            synthesis_files = []
-            lang = self.user_valves.preferred_language
-            analyses_to_run = [
-                ("ARCHITECTURE.md", "architecture"),
-                ("API_SUMMARY.md", "api"),
-                ("CODE_MAP.md", "codemap"),
-            ]
-
-            for filename, analysis_type in analyses_to_run:
-                if __event_emitter__:
-                    await __event_emitter__({
-                        "type": "status",
-                        "data": {
-                            "description": f"🤖 Génération {filename}...",
-                            "done": False,
-                            "hidden": False,
-                        },
-                    })
-                try:
-                    base_prompt = self._analysis_prompts[analysis_type].get(
-                        lang, self._analysis_prompts[analysis_type]["en"]
-                    )
-                    extra = getattr(
-                        self.user_valves, f"prompt_extra_{analysis_type}", ""
-                    )
-                    prompt = (
-                        f"{base_prompt}\n\nStyle: {self.user_valves.prompt_style}\n"
-                        f"Extra: {extra}\nLanguage: {lang}"
-                    )
-                    result = await self._execute_llm_cli(
-                        llm_cli, bin_path, prompt, code_context, __event_emitter__
-                    )
-                    if result:
-                        file_path = os.path.join(analysis_dir, filename)
-                        async with aiofiles.open(file_path, "w", encoding="utf-8") as f:
-                            await f.write(result)
-                        synthesis_files.append(filename)
-                        self.logger.info(f"Synthèse générée: {filename}")
-                except Exception as e:
-                    self.logger.error(f"Erreur génération {filename}: {e}")
-                    continue
-
-            llm_info = {
-                "cli_name": llm_cli,
-                "bin_path": bin_path,
-                "model": self.user_valves.llm_model_name,
-            }
-            self.logger.info(
-                f"Analyse LLM terminée: {len(synthesis_files)} synthèses générées"
-            )
-            return synthesis_files, llm_info
-        except Exception as e:
-            self.logger.error(f"Erreur analyse LLM: {e}", exc_info=True)
-            return [], {}
-
-    async def _get_available_llm_cli(self) -> Optional[str]:
-        """
-        Détecte le LLM CLI disponible
-        
-        Teste la disponibilité des différents LLM CLI selon la configuration
-        utilisateur ou détection automatique.
-        
-        Returns:
-            Nom du LLM CLI disponible ou None
-        """
-        try:
-            choice = self.user_valves.llm_cli_choice.lower()
-            
-            if choice == "auto":
-                # Test automatique dans l'ordre de préférence
-                for llm in ["qwen", "gemini"]:
-                    if await self._test_llm_cli(llm):
-                        self.logger.info(f"LLM CLI détecté automatiquement: {llm}")
-                        return llm
-                return None
-            else:
-                # Test du choix utilisateur
-                if await self._test_llm_cli(choice):
-                    return choice
-                else:
-                    self.logger.warning(f"LLM CLI {choice} non disponible")
-                    return None
-                    
-        except Exception as e:
-            self.logger.error(f"Erreur détection LLM CLI: {e}")
-            return None
-
-    def _resolve_executable(self, name: str) -> Optional[str]:
-        """Résout le chemin absolu d'un exécutable.
-
-        Recherche dans le PATH courant puis dans les répertoires
-        additionnels définis par ``extra_bin_dirs`` (séparés par ``:``).
-
-        Args:
-            name: Nom de l'exécutable à rechercher.
-
-        Returns:
-            Chemin absolu de l'exécutable ou ``None`` si introuvable.
-        """
+    # -------------------------------------
+    # LLM helpers (CLI)
+    # -------------------------------------
+    def _resolve_executable(self, name: str) -> str | None:
         path = shutil.which(name)
         if path:
             return path
-
-        extra = self.valves.extra_bin_dirs
-        if extra:
-            for d in extra.split(":"):
-                d = d.strip()
-                if not d:
-                    continue
-                candidate = shutil.which(os.path.join(os.path.expanduser(d), name))
-                if candidate:
-                    return candidate
+        extra = self.valves.extra_bin_dirs or ""
+        for d in [p for p in extra.split(":") if p.strip()]:
+            cand = shutil.which(os.path.join(os.path.expanduser(d), name))
+            if cand:
+                return cand
         return None
 
-    async def _test_llm_cli(self, llm_name: str) -> bool:
-        """Test la disponibilité d'un LLM CLI spécifique."""
+    def _test_llm_cli(self, bin_name: str) -> tuple[bool, str]:
         try:
-            # Utilise un binaire personnalisé si l'utilisateur a choisi ce LLM
-            bin_name = (
-                self.user_valves.llm_bin_name
-                if llm_name == self.user_valves.llm_cli_choice.lower()
-                else llm_name
-            )
             bin_path = self._resolve_executable(bin_name)
             if not bin_path:
-                return False
-
-            process = await asyncio.create_subprocess_exec(
-                bin_path,
-                "--version",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+                return False, f"binaire introuvable: {bin_name}"
+            proc = subprocess.run(
+                [bin_path, "--version"], capture_output=True, text=True, timeout=10
             )
+            ok = proc.returncode == 0
+            out = (proc.stdout or proc.stderr).strip()
+            return ok, f"{bin_path} --version -> rc={proc.returncode} out='{out[:200]}'"
+        except Exception as e:
+            return False, f"exception: {e}"
 
-            await asyncio.wait_for(process.communicate(), timeout=10)
-            return process.returncode == 0
+    def _pick_llm(self, llm: str) -> str | None:
+        choice = (llm or self.user_valves.llm_cli_choice or "auto").strip().lower()
+        if choice == "auto":
+            for cand in ("qwen", "gemini"):
+                ok, _ = self._test_llm_cli(cand)
+                if ok:
+                    return cand
+            return None
+        ok, _ = self._test_llm_cli(choice)
+        return choice if ok else None
 
-        except Exception:
-            return False
+    def _execute_llm_cli(
+        self, bin_name: str, model: str, prompt: str, context: str
+    ) -> tuple[int, str, str, float]:
+        bin_path = self._resolve_executable(bin_name)
+        if not bin_path:
+            return 127, "", f"Binaire LLM introuvable: {bin_name}", 0.0
 
-    def _redact_secrets(self, text: str) -> str:
-        """Masque les secrets communs dans le texte fourni.
+        argv = [bin_path, "--model", model, "--prompt", prompt]
+        log_cmd = self.user_valves.llm_cmd_template.format(
+            bin=bin_path, model=model, prompt="<prompt>"
+        )
+        ctx_bytes = len(context.encode("utf-8", errors="ignore"))
+        self.logger.info("[LLM] run: %s | context=%s bytes", log_cmd, ctx_bytes)
 
-        Cette redaction simple remplace les valeurs sensibles par '****'.
-        """
+        t0 = time.perf_counter()
         try:
-            # Paires clef=valeur classiques (.env)
-            text = re.sub(
-                r"(?i)(API_KEY|SECRET|TOKEN|PASSWORD|AWS_SECRET_ACCESS_KEY)\s*=\s*[^\s]+",
-                lambda m: f"{m.group(1)}=****",
-                text,
+            proc = subprocess.Popen(
+                argv,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
             )
+            try:
+                out, err = proc.communicate(
+                    input=context.encode("utf-8"),
+                    timeout=float(self.valves.llm_timeout_s),
+                )
+                dur = time.perf_counter() - t0
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                out, err = proc.communicate()
+                dur = time.perf_counter() - t0
+                return (
+                    124,
+                    out.decode("utf-8", "ignore"),
+                    f"Timeout après {self.valves.llm_timeout_s}s",
+                    dur,
+                )
 
-            # Jetons GitHub personnels
-            text = re.sub(r"ghp_[A-Za-z0-9]+", "ghp_****", text)
+            rc = proc.returncode
+            return rc, out.decode("utf-8", "ignore"), err.decode("utf-8", "ignore"), dur
+        except Exception as e:
+            dur = time.perf_counter() - t0
+            return 1, "", f"Exception exécution LLM: {e}", dur
 
-            # Tokens JWT basiques
-            text = re.sub(
-                r"eyJ[\w-]+?\.[\w-]+?\.[\w-]+",
-                "****",
-                text,
-            )
+    # -------------------------------------
+    # Contexte de code
+    # -------------------------------------
+    def _prepare_code_context(self, repo_dir: str, depth: str) -> str:
+        max_ctx = int(self.valves.max_context_bytes)
+        max_file = int(self.valves.max_bytes_per_file)
 
-            return text
-        except Exception:
-            # En cas de problème de regex, retourner le texte original
-            return text
+        includes = (
+            self.user_valves.custom_globs_include or self.valves.default_globs_include
+        ).split(",")
+        excludes = (
+            self.user_valves.custom_globs_exclude or self.valves.default_globs_exclude
+        ).split(",")
+        inc, exc = self._build_specs(includes, excludes)
 
-    async def _prepare_code_context(
-        self,
-        repo_path: str,
-        file_stats: Optional[Dict[str, Any]] = None,
-        prev_metadata: Optional[dict] = None,
-    ) -> Tuple[str, int]:
-        """
-        Prépare le contexte de code pour l'analyse LLM.
+        # fichiers prioritaires
+        priority = [
+            "README.md",
+            "README.rst",
+            "README.txt",
+            "package.json",
+            "requirements.txt",
+            "pyproject.toml",
+            "setup.py",
+            "Cargo.toml",
+            "go.mod",
+            "composer.json",
+        ]
 
-        Returns:
-            Tuple[str, int]: Contexte formaté et nombre de fichiers ajoutés.
-        """
+        def append(buf: List[str], chunk: str, total: int) -> tuple[bool, int]:
+            b = chunk.encode("utf-8", "ignore")
+            if total + len(b) > max_ctx:
+                remain = max_ctx - total - len(b"... [TRUNCATED CONTEXT] ...")
+                if remain > 0:
+                    buf.append(b.decode("utf-8", "ignore")[:remain])
+                buf.append("... [TRUNCATED CONTEXT] ...")
+                return False, max_ctx
+            buf.append(chunk)
+            return True, total + len(b)
+
+        parts: List[str] = []
+        used = 0
+
+        # 1) priority
+        for fname in priority:
+            fpath = os.path.join(repo_dir, fname)
+            if os.path.isfile(fpath):
+                try:
+                    with open(fpath, "rb") as f:
+                        data = f.read(max_file)
+                    chunk = f"=== {fname} ===\n{data.decode('utf-8', 'ignore')}\n"
+                    ok, used = append(parts, chunk, used)
+                    if not ok:
+                        self.logger.info("[CTX] tronqué après priority; size=%s", used)
+                        return self._redact_secrets("".join(parts))
+                except Exception:
+                    continue
+
+        # 2) scan fichiers eligibles
+        depth = (depth or self.user_valves.analysis_depth or "standard").lower()
+        limits = {"quick": 10, "standard": 25, "deep": 50}
+        max_files = limits.get(depth, 25)
+
+        files: List[str] = []
+        for root, dirs, filenames in os.walk(repo_dir):
+            rel_root = os.path.relpath(root, repo_dir)
+            if rel_root == ".":
+                rel_root = ""
+
+            # filtres dossiers exclus
+            keep = []
+            for d in dirs:
+                rel_dir = os.path.join(rel_root, d) if rel_root else d
+                if exc.match_file(rel_dir):
+                    continue
+                keep.append(d)
+            dirs[:] = keep
+
+            for fn in filenames:
+                rel_path = os.path.join(rel_root, fn) if rel_root else fn
+                if exc.match_file(rel_path) or not inc.match_file(rel_path):
+                    continue
+                full = os.path.join(repo_dir, rel_path)
+                try:
+                    st = os.stat(full)
+                    if not stat.S_ISREG(st.st_mode):
+                        continue
+                    if st.st_size > self.valves.max_file_size_kb * 1024:
+                        continue
+                    files.append(rel_path)
+                except Exception:
+                    continue
+
+        # on garde les max_files premiers (ordre OS)
+        for rel in files[:max_files]:
+            full = os.path.join(repo_dir, rel)
+            try:
+                with open(full, "rb") as f:
+                    data = f.read(max_file)
+                chunk = f"=== {rel} ===\n{data.decode('utf-8', 'ignore')}\n"
+                ok, used = append(parts, chunk, used)
+                if not ok:
+                    self.logger.info("[CTX] tronqué; size=%s", used)
+                    break
+            except Exception:
+                continue
+
+        ctx = "".join(parts)
+        self.logger.info(
+            "[CTX] prêt: %s bytes (avant redaction)", len(ctx.encode("utf-8", "ignore"))
+        )
+        return self._redact_secrets(ctx)
+
+    # =====================================================================
+    # 🔓 FONCTIONS PUBLIQUES (lecture + git manuel + LLM)
+    # =====================================================================
+
+    @staticmethod
+    def tool_health(dummy: str = "") -> str:
+        p = Tools._paths()
+        return (
+            f"OK | base_dir={p['base']} | repos_dir={p['repos']} | logs_dir={p['logs']}"
+        )
+
+    @staticmethod
+    def debug_status(message: str = "ping") -> str:
+        return f"DEBUG_STATUS: {message}"
+
+    @staticmethod
+    def list_repos() -> str:
+        p = Tools._paths()
+        repos_path = p["repos"]
         try:
-            max_ctx = self.valves.max_context_bytes
-            max_file = self.valves.max_bytes_per_file
+            if not os.path.exists(repos_path):
+                return "📁 Aucun dépôt (dossier 'git_repos' introuvable)."
 
-            context_parts: List[str] = []
-            total_bytes = 0
-            changed_files = 0
-
-            marker = "[... CONTEXTE TRONQUÉ ...]"
-            marker_bytes = len(marker.encode("utf-8"))
-
-            def append_part(part: str) -> bool:
-                nonlocal total_bytes
-                part_bytes = len(part.encode("utf-8"))
-                if total_bytes + part_bytes > max_ctx:
-                    allowed = max_ctx - total_bytes - marker_bytes
-                    if allowed > 0:
-                        truncated = part.encode("utf-8")[:allowed].decode("utf-8", errors="ignore")
-                        context_parts.append(truncated)
-                        total_bytes += allowed
-                    context_parts.append(marker)
-                    total_bytes = max_ctx
-                    return False
-                context_parts.append(part)
-                total_bytes += part_bytes
-                return True
-
-            priority_files = [
-                "README.md", "README.rst", "README.txt",
-                "package.json", "setup.py", "Cargo.toml", "go.mod",
-                "requirements.txt", "pyproject.toml", "composer.json"
+            entries = [
+                d
+                for d in sorted(os.listdir(repos_path))
+                if os.path.isdir(os.path.join(repos_path, d))
             ]
+            if not entries:
+                return "📁 Aucun dépôt trouvé dans git_repos."
 
-            for priority_file in priority_files:
-                file_path = os.path.join(repo_path, priority_file)
-                if os.path.exists(file_path) and not self._is_binary_file(file_path):
+            lines = ["## Dépôts disponibles:", ""]
+            for d in entries:
+                lines.append(f"- {d}")
+            return "\n".join(lines)
+        except Exception as e:
+            return f"❌ Erreur list_repos: {e}"
+
+    @staticmethod
+    def list_analyzed_repos() -> str:
+        p = Tools._paths()
+        repos_path = p["repos"]
+        try:
+            if not os.path.exists(repos_path):
+                return "📁 Aucun dépôt (dossier 'git_repos' introuvable)."
+
+            repos = []
+            for d in sorted(os.listdir(repos_path)):
+                repo_dir = os.path.join(repos_path, d)
+                if not os.path.isdir(repo_dir):
+                    continue
+                analysis_dir = os.path.join(repo_dir, "docs_analysis")
+                if not os.path.isdir(analysis_dir):
+                    continue
+
+                metadata_path = os.path.join(analysis_dir, "analysis_metadata.json")
+                meta = {}
+                if os.path.exists(metadata_path):
                     try:
-                        async with aiofiles.open(file_path, "rb") as f:
-                            data = await f.read(max_file)
-                        content = data.decode("utf-8", errors="ignore")
-                        part = f"=== {priority_file} ===\n{content}\n"
-                        if not append_part(part):
-                            self.logger.info(f"Contexte tronqué à {total_bytes} octets")
-                            return self._redact_secrets("".join(context_parts)), changed_files
+                        with open(
+                            metadata_path, "r", encoding="utf-8", errors="ignore"
+                        ) as f:
+                            meta = json.load(f)
+                    except Exception:
+                        meta = {}
+
+                repos.append(
+                    {
+                        "name": d,
+                        "has_metadata": bool(meta),
+                        "last_analysis": (
+                            meta.get("analysis_timestamp") if meta else None
+                        ),
+                        "llm_cli_used": meta.get("llm_cli_used") if meta else None,
+                        "synthesis_count": (
+                            meta.get("synthesis_count") if meta else None
+                        ),
+                    }
+                )
+
+            if not repos:
+                return "ℹ️ Aucun dépôt analysé (pas de dossier docs_analysis)."
+
+            lines = ["## Dépôts analysés:", ""]
+            for r in repos:
+                badge = "✅" if r["has_metadata"] else "ℹ️"
+                last = r["last_analysis"] or "n/d"
+                llm = r["llm_cli_used"] or "n/d"
+                syn = (
+                    r["synthesis_count"] if r["synthesis_count"] is not None else "n/d"
+                )
+                lines.append(
+                    f"- {badge} **{r['name']}** — dernière analyse: {last} — LLM: {llm} — synthèses: {syn}"
+                )
+            return "\n".join(lines)
+
+        except Exception as e:
+            return f"❌ Erreur list_analyzed_repos: {e}"
+
+    @staticmethod
+    def repo_info(repo_name: str) -> str:
+        p = Tools._paths()
+        safe = Tools._sanitize_repo_name(repo_name)
+        repo_path = os.path.join(p["repos"], safe)
+        analysis_dir = os.path.join(repo_path, "docs_analysis")
+
+        if not os.path.isdir(repo_path):
+            return f"❌ Dépôt introuvable: {safe}"
+
+        lines = [f"## Infos dépôt: {safe}", f"📂 {repo_path}", ""]
+        if not os.path.isdir(analysis_dir):
+            lines.append("ℹ️ Pas de dossier `docs_analysis/`.")
+            return "\n".join(lines)
+
+        metadata_path = os.path.join(analysis_dir, "analysis_metadata.json")
+        meta = {}
+        if os.path.exists(metadata_path):
+            try:
+                with open(metadata_path, "r", encoding="utf-8", errors="ignore") as f:
+                    meta = json.load(f)
+            except Exception as e:
+                lines.append(f"❌ Erreur lecture metadata: {e}")
+
+        if meta:
+            lines.append("### Métadonnées")
+            lines.append(
+                f"- Dernière analyse : {meta.get('analysis_timestamp', 'n/d')}"
+            )
+            lines.append(f"- LLM utilisé      : {meta.get('llm_cli_used', 'n/d')}")
+            lines.append(f"- Synthèses        : {meta.get('synthesis_count', 'n/d')}")
+            user_cfg = meta.get("user_config", {})
+            if isinstance(user_cfg, dict) and user_cfg:
+                lines.append(f"- Profil utilisateur: {user_cfg}")
+            lines.append("")
+
+        wanted = ["ARCHITECTURE.md", "API_SUMMARY.md", "CODE_MAP.md"]
+        lines.append("### Fichiers de synthèse présents")
+        found = False
+        for fname in wanted:
+            fpath = os.path.join(analysis_dir, fname)
+            if os.path.exists(fpath) and os.path.isfile(fpath):
+                try:
+                    size = os.path.getsize(fpath)
+                except Exception:
+                    size = 0
+                lines.append(f"- ✅ {fname} ({size} octets)")
+                found = True
+        if not found:
+            lines.append("- (aucun)")
+        return "\n".join(lines)
+
+    @staticmethod
+    def get_repo_context(
+        repo_name: str, max_files: int = 3, max_chars_per_file: int = 2000
+    ) -> str:
+        p = Tools._paths()
+        safe = Tools._sanitize_repo_name(repo_name)
+        repo_path = os.path.join(p["repos"], safe)
+        analysis = os.path.join(repo_path, "docs_analysis")
+
+        if not os.path.exists(repo_path):
+            return f"❌ Dépôt introuvable: {safe}"
+        if not os.path.isdir(analysis):
+            return f"ℹ️ Pas de docs_analysis pour: {safe}"
+
+        wanted = ["ARCHITECTURE.md", "API_SUMMARY.md", "CODE_MAP.md"]
+        shown = 0
+        out = [
+            f"## Contexte pour {safe}",
+            f"(max_files={max_files}, max_chars_per_file={max_chars_per_file})",
+            "",
+        ]
+
+        for fname in wanted:
+            if shown >= max_files:
+                break
+            fpath = os.path.join(analysis, fname)
+            if os.path.exists(fpath) and os.path.isfile(fpath):
+                try:
+                    with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                        content = f.read(max_chars_per_file)
+                    out.append(f"### {fname}")
+                    out.append("```markdown")
+                    out.append(content)
+                    out.append("```")
+                    out.append("")
+                    shown += 1
+                except Exception as e:
+                    out.append(f"❌ Erreur lecture {fname}: {e}")
+
+        if shown == 0:
+            return f"ℹ️ Aucun fichier de synthèse trouvé dans {analysis}"
+        return "\n".join(out)
+
+    @staticmethod
+    def scan_repo_files(
+        repo_name: str, limit: int = 50, order: str = "size", ascending: bool = False
+    ) -> str:
+        try:
+            p = Tools._paths()
+            safe = Tools._sanitize_repo_name(repo_name)
+            repo = os.path.join(p["repos"], safe)
+            if not os.path.isdir(repo):
+                return f"❌ Dépôt introuvable: {safe}"
+
+            _tmp = Tools()
+            includes = (
+                _tmp.user_valves.custom_globs_include
+                or _tmp.valves.default_globs_include
+            ).split(",")
+            excludes = (
+                _tmp.user_valves.custom_globs_exclude
+                or _tmp.valves.default_globs_exclude
+            ).split(",")
+            max_kb = int(_tmp.valves.max_file_size_kb)
+
+            inc, exc = Tools._build_specs(includes, excludes)
+
+            files: List[Dict[str, Any]] = []
+            for root, dirs, filenames in os.walk(repo):
+                rel_root = os.path.relpath(root, repo)
+                if rel_root == ".":
+                    rel_root = ""
+
+                keep_dirs = []
+                for d in dirs:
+                    rel_dir = os.path.join(rel_root, d) if rel_root else d
+                    if exc.match_file(rel_dir):
+                        continue
+                    keep_dirs.append(d)
+                dirs[:] = keep_dirs
+
+                for fn in filenames:
+                    rel_path = os.path.join(rel_root, fn) if rel_root else fn
+                    if exc.match_file(rel_path):
+                        continue
+                    if not inc.match_file(rel_path):
+                        continue
+
+                    full = os.path.join(repo, rel_path)
+                    try:
+                        st = os.stat(full)
+                        if not stat.S_ISREG(st.st_mode):
+                            continue
+                        size = st.st_size
+                        if size > max_kb * 1024:
+                            continue
+                        files.append({"path": rel_path, "size": size})
                     except Exception:
                         continue
 
-            if file_stats is None:
-                file_stats = await self._scan_repository_files(repo_path)
+            total = len(files)
+            if order not in ("size", "path"):
+                order = "size"
+            reverse = not ascending
+            files.sort(key=(lambda x: x[order]), reverse=reverse)
 
-            depth_limits = {"quick": 10, "standard": 25, "deep": 50}
-            max_files = depth_limits.get(self.user_valves.analysis_depth, 25)
+            sel = files[: max(0, int(limit))]
+            total_size = sum(f["size"] for f in files)
+            shown_size = sum(f["size"] for f in sel)
 
-            files_list = file_stats["files"]
-            if (
-                self.user_valves.analysis_mode == "diff" and prev_metadata is not None
-            ):
-                prev_map = {f["path"]: f.get("sha256") for f in prev_metadata.get("files", [])}
-                changed = []
-                for f in files_list:
-                    if prev_map.get(f["path"]) != f.get("sha256"):
-                        changed.append(f)
-                files_list = changed
-
-            selected_files = files_list[:max_files]
-
-            sem = asyncio.Semaphore(8)
-
-            async def read_file(info: Dict[str, Any]) -> Tuple[str, Optional[str]]:
-                path = os.path.join(repo_path, info["path"])
-                if self._is_binary_file(path):
-                    return info["path"], None
-                async with sem:
-                    try:
-                        async with aiofiles.open(path, "rb") as f:
-                            data = await f.read(max_file)
-                        return info["path"], data.decode("utf-8", errors="ignore")
-                    except Exception:
-                        return info["path"], None
-
-            results = await asyncio.gather(*(read_file(f) for f in selected_files))
-
-            for rel_path, content in results:
-                if content is None:
-                    continue
-                part = f"=== {rel_path} ===\n{content}\n"
-                if not append_part(part):
-                    self.logger.info(f"Contexte tronqué à {total_bytes} octets")
-                    return self._redact_secrets("".join(context_parts)), changed_files
-                changed_files += 1
-
-            self.logger.info(f"Contexte total préparé: {total_bytes} octets")
-            return self._redact_secrets("".join(context_parts)), changed_files
-
-        except Exception as e:
-            self.logger.error(f"Erreur préparation contexte: {e}")
-            return "", 0
-
-    async def _execute_llm_cli(
-        self,
-        llm_cli: str,
-        bin_path: str,
-        prompt: str,
-        context: str,
-        __event_emitter__: Optional[Callable[[dict], Awaitable[None]]] = None,
-    ) -> Optional[str]:
-        """Exécute le LLM CLI avec le prompt et le contexte via stdin."""
-
-        if llm_cli == "gemini":
-            argv = [
-                bin_path,
-                "--model",
-                self.user_valves.llm_model_name,
-                "-p",
-                prompt,
+            lines = [
+                f"## Scan fichiers — dépôt: {safe}",
+                f"- Fichiers éligibles: {total}",
+                f"- Somme tailles (éligibles): {total_size} octets",
+                f"- Affichés: {len(sel)} (ordre={order}, ascending={ascending})",
+                f"- Somme tailles (affichés): {shown_size} octets",
+                "",
+                "### Fichiers",
             ]
-        else:
-            argv = [
-                bin_path,
-                "--model",
-                self.user_valves.llm_model_name,
-                "--prompt",
-                prompt,
-            ]
-
-        log_cmd = " ".join(argv[:-1] + ["<prompt>"])
-        context_size = len(context.encode("utf-8"))
-        self.logger.info(
-            f"Exécution LLM: {log_cmd} | contexte {context_size} octets"
-        )
-
-        start = time.perf_counter()
-        try:
-            process = await asyncio.create_subprocess_exec(
-                *argv,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(input=context.encode("utf-8")),
-                timeout=self.valves.llm_timeout_s,
-            )
-            duration = time.perf_counter() - start
-            out_text = stdout.decode("utf-8", errors="ignore")
-            err_text = stderr.decode("utf-8", errors="ignore")
-
-            if process.returncode != 0:
-                self.logger.error(
-                    f"LLM CLI échec (code {process.returncode}) après {duration:.1f}s: {err_text.strip()}"
-                )
-                if __event_emitter__:
-                    truncated = (
-                        err_text.strip()[:200] + "..."
-                        if len(err_text.strip()) > 200
-                        else err_text.strip()
-                    )
-                    await __event_emitter__({
-                        "type": "status",
-                        "data": {
-                            "description": f"Erreur LLM CLI: {truncated}",
-                            "done": True,
-                            "hidden": False,
-                        },
-                    })
-                return None
-
-            self.logger.info(
-                f"LLM CLI terminé en {duration:.1f}s (code {process.returncode})"
-            )
-            return out_text.strip()
-
-        except asyncio.TimeoutError:
-            process.kill()
-            await process.communicate()
-            msg = f"Timeout LLM CLI après {self.valves.llm_timeout_s}s"
-            self.logger.error(msg)
-            if __event_emitter__:
-                await __event_emitter__({
-                    "type": "status",
-                    "data": {"description": msg, "done": True, "hidden": False},
-                })
-            return None
-        except Exception as e:
-            self.logger.error(f"Erreur exécution LLM CLI: {e}", exc_info=True)
-            if __event_emitter__:
-                await __event_emitter__({
-                    "type": "status",
-                    "data": {"description": f"Erreur LLM CLI: {e}", "done": True, "hidden": False},
-                })
-            return None
-
-    async def _save_analysis_metadata(
-        self,
-        repo_path: str,
-        repo_info: Dict[str, str],
-        file_stats: Dict[str, Any],
-        llm_info: Dict[str, str],
-        synthesis_count: int,
-        prev_metadata: Optional[dict] = None,
-    ) -> None:
-        """Sauvegarde les métadonnées de l'analyse."""
-        try:
-            analysis_dir = os.path.join(repo_path, "docs_analysis")
-            os.makedirs(analysis_dir, exist_ok=True)
-
-            try:
-                head = await self._git_head(repo_path)
-            except Exception:
-                head = ""
-
-            if prev_metadata:
-                files_meta = prev_metadata.get("files", [])
+            if not sel:
+                lines.append("(aucun)")
             else:
-                files_meta = [
-                    {
-                        "path": f["path"],
-                        "size": f.get("size", 0),
-                        "sha256": f.get("sha256", ""),
-                        "analyzed_at": datetime.now().isoformat(),
-                    }
-                    for f in file_stats.get("files", [])
-                ]
-
-            metadata = {
-                "repo_info": repo_info,
-                "analysis_timestamp": datetime.now().isoformat(),
-                "tool_version": TOOL_VERSION,
-                "repo_head_commit": head,
-                "scan_config": {
-                    "include": file_stats.get("include_patterns", []),
-                    "exclude": file_stats.get("exclude_patterns", []),
-                    "max_file_size_kb": self.valves.max_file_size_kb,
-                },
-                "files": files_meta,
-                "llm": llm_info,
-                "synthesis_count": synthesis_count,
-            }
-
-            metadata_path = os.path.join(analysis_dir, "analysis_metadata.json")
-            async with aiofiles.open(metadata_path, "w", encoding="utf-8") as f:
-                await f.write(json.dumps(metadata, indent=2, ensure_ascii=False))
-
-            self.logger.info(f"Métadonnées sauvegardées: {metadata_path}")
+                for f in sel:
+                    lines.append(f"- {f['path']}  ({f['size']} o)")
+            return "\n".join(lines)
 
         except Exception as e:
-            self.logger.error(f"Erreur sauvegarde métadonnées: {e}")
+            return f"❌ Erreur scan_repo_files: {e}"
 
-    async def _inject_repository_context(
-        self, 
-        repo_path: str, 
-        repo_info: Dict[str, str], 
-        synthesis_files: List[str],
-        __event_emitter__: Optional[Callable[[dict], Awaitable[None]]] = None
+    @staticmethod
+    def preview_file(repo_name: str, relative_path: str, max_bytes: int = 65536) -> str:
+        try:
+            if max_bytes <= 0:
+                max_bytes = 4096
+            max_bytes = min(max_bytes, 2_000_000)
+
+            p = Tools._paths()
+            safe = Tools._sanitize_repo_name(repo_name)
+            repo = os.path.join(p["repos"], safe)
+            if not os.path.isdir(repo):
+                return f"❌ Dépôt introuvable: {safe}"
+
+            target = os.path.realpath(os.path.join(repo, relative_path))
+            repo_real = os.path.realpath(repo)
+            if not (target == repo_real or target.startswith(repo_real + os.sep)):
+                return "❌ Chemin refusé (hors dépôt)."
+
+            if not os.path.isfile(target):
+                return "❌ Fichier introuvable."
+
+            with open(target, "rb") as fb:
+                head = fb.read(4096)
+                if Tools._looks_binary(head):
+                    return (
+                        "❌ Fichier binaire / non texte (prévisualisation désactivée)."
+                    )
+
+            with open(target, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read(max_bytes)
+
+            lang = Tools._ext_lang_hint(target)
+            fence = lang if lang else ""
+            rel = os.path.relpath(target, repo_real)
+            size = os.path.getsize(target)
+
+            lines = [
+                f"## Aperçu: {rel}",
+                f"- Taille: {size} octets",
+                f"- Affiché: jusqu’à {max_bytes} octets",
+                "",
+                f"```{fence}",
+                content,
+                "```",
+            ]
+            return "\n".join(lines)
+
+        except Exception as e:
+            return f"❌ Erreur preview_file: {e}"
+
+    @staticmethod
+    def stats_repo(repo_name: str, top_n: int = 10) -> str:
+        try:
+            p = Tools._paths()
+            safe = Tools._sanitize_repo_name(repo_name)
+            repo = os.path.join(p["repos"], safe)
+            if not os.path.isdir(repo):
+                return f"❌ Dépôt introuvable: {safe}"
+
+            _tmp = Tools()
+            includes = (
+                _tmp.user_valves.custom_globs_include
+                or _tmp.valves.default_globs_include
+            ).split(",")
+            excludes = (
+                _tmp.user_valves.custom_globs_exclude
+                or _tmp.valves.default_globs_exclude
+            ).split(",")
+            max_kb = int(_tmp.valves.max_file_size_kb)
+            inc, exc = Tools._build_specs(includes, excludes)
+
+            ext_count: Dict[str, int] = {}
+            ext_bytes: Dict[str, int] = {}
+            files: List[Dict[str, Any]] = []
+
+            for root, dirs, filenames in os.walk(repo):
+                rel_root = os.path.relpath(root, repo)
+                if rel_root == ".":
+                    rel_root = ""
+
+                keep_dirs = []
+                for d in dirs:
+                    rel_dir = os.path.join(rel_root, d) if rel_root else d
+                    if exc.match_file(rel_dir):
+                        continue
+                    keep_dirs.append(d)
+                dirs[:] = keep_dirs
+
+                for fn in filenames:
+                    rel_path = os.path.join(rel_root, fn) if rel_root else fn
+                    if exc.match_file(rel_path) or not inc.match_file(rel_path):
+                        continue
+                    full = os.path.join(repo, rel_path)
+                    try:
+                        st = os.stat(full)
+                        if not stat.S_ISREG(st.st_mode):
+                            continue
+                        size = st.st_size
+                        if size > max_kb * 1024:
+                            continue
+                        files.append({"path": rel_path, "size": size})
+                        ext = os.path.splitext(fn)[1].lower() or "(noext)"
+                        ext_count[ext] = ext_count.get(ext, 0) + 1
+                        ext_bytes[ext] = ext_bytes.get(ext, 0) + size
+                    except Exception:
+                        continue
+
+            total_files = len(files)
+            total_bytes = sum(f["size"] for f in files)
+            top_files = sorted(files, key=lambda x: x["size"], reverse=True)[
+                : max(1, int(top_n))
+            ]
+            top_ext = sorted(
+                ext_count.items(), key=lambda kv: ext_bytes.get(kv[0], 0), reverse=True
+            )[:10]
+
+            lines = [
+                f"## Stats — dépôt: {safe}",
+                f"- Fichiers éligibles: {total_files}",
+                f"- Taille totale: {total_bytes} octets",
+                "",
+                "### Top extensions (par octets)",
+            ]
+            if not top_ext:
+                lines.append("(aucune)")
+            else:
+                for ext, cnt in top_ext:
+                    lines.append(f"- {ext}: {cnt} fichiers, {ext_bytes.get(ext, 0)} o")
+
+            lines.append("")
+            lines.append(f"### Top {top_n} fichiers (par taille)")
+            if not top_files:
+                lines.append("(aucun)")
+            else:
+                for f in top_files:
+                    lines.append(f"- {f['path']}  ({f['size']} o)")
+            return "\n".join(lines)
+
+        except Exception as e:
+            return f"❌ Erreur stats_repo: {e}"
+
+    @staticmethod
+    def find_in_repo(
+        repo_name: str, needle: str, use_regex: bool = False, max_matches: int = 50
+    ) -> str:
+        try:
+            p = Tools._paths()
+            safe = Tools._sanitize_repo_name(repo_name)
+            repo = os.path.join(p["repos"], safe)
+            if not os.path.isdir(repo):
+                return f"❌ Dépôt introuvable: {safe}"
+
+            _tmp = Tools()
+            includes = (
+                _tmp.user_valves.custom_globs_include
+                or _tmp.valves.default_globs_include
+            ).split(",")
+            excludes = (
+                _tmp.user_valves.custom_globs_exclude
+                or _tmp.valves.default_globs_exclude
+            ).split(",")
+            max_kb = int(_tmp.valves.max_file_size_kb)
+            inc, exc = Tools._build_specs(includes, excludes)
+
+            pattern = None
+            if use_regex:
+                try:
+                    pattern = re.compile(needle, flags=re.IGNORECASE)
+                except re.error as e:
+                    return f"❌ Regex invalide: {e}"
+
+            results = []
+            for root, dirs, filenames in os.walk(repo):
+                rel_root = os.path.relpath(root, repo)
+                if rel_root == ".":
+                    rel_root = ""
+
+                keep_dirs = []
+                for d in dirs:
+                    rel_dir = os.path.join(rel_root, d) if rel_root else d
+                    if exc.match_file(rel_dir):
+                        continue
+                    keep_dirs.append(d)
+                dirs[:] = keep_dirs
+
+                for fn in filenames:
+                    rel_path = os.path.join(rel_root, fn) if rel_root else fn
+                    if exc.match_file(rel_path) or not inc.match_file(rel_path):
+                        continue
+
+                    full = os.path.join(repo, rel_path)
+                    try:
+                        st = os.stat(full)
+                        if not stat.S_ISREG(st.st_mode):
+                            continue
+                        size = st.st_size
+                        if size > max_kb * 1024:
+                            continue
+
+                        with open(full, "rb") as fb:
+                            head = fb.read(4096)
+                            if Tools._looks_binary(head):
+                                continue
+                        with open(full, "r", encoding="utf-8", errors="ignore") as f:
+                            for idx, line in enumerate(f, start=1):
+                                hit = (
+                                    (pattern.search(line) is not None)
+                                    if pattern
+                                    else (needle.lower() in line.lower())
+                                )
+                                if hit:
+                                    snippet = line.strip()
+                                    results.append(f"- {rel_path}:{idx}: {snippet}")
+                                    if len(results) >= max(1, int(max_matches)):
+                                        raise StopIteration
+                    except StopIteration:
+                        break
+                    except Exception:
+                        continue
+                if len(results) >= max(1, int(max_matches)):
+                    break
+
+            if not results:
+                return f"🔎 Aucun résultat pour « {needle} » (use_regex={use_regex}) dans {safe}."
+            header = [
+                f"## Recherche « {needle} » (regex={use_regex}) — dépôt: {safe}",
+                "",
+            ]
+            return "\n".join(header + results)
+
+        except Exception as e:
+            return f"❌ Erreur find_in_repo: {e}"
+
+    @staticmethod
+    def git_clone(repo_url: str, name: str = "") -> str:
+        try:
+            info = Tools._parse_git_url(repo_url)
+            _tmp = Tools()
+
+            allowed = [
+                h.strip()
+                for h in _tmp.valves.supported_git_hosts.split(",")
+                if h.strip()
+            ]
+            if info["host"] not in allowed:
+                return f"❌ Hôte non supporté: {info['host']} (allow: {', '.join(allowed)})"
+
+            repo_name = Tools._sanitize_repo_name(name or info["repo_name"])
+            p = Tools._paths()
+            target = os.path.join(p["repos"], repo_name)
+
+            if os.path.exists(target):
+                return f"ℹ️ Dépôt existe déjà: {repo_name}"
+
+            os.makedirs(p["repos"], exist_ok=True)
+
+            cmd = ["git", "clone", repo_url, repo_name]
+            completed = subprocess.run(
+                cmd,
+                cwd=p["repos"],
+                capture_output=True,
+                text=True,
+                timeout=max(30, int(_tmp.valves.git_timeout_s)),
+                check=False,
+            )
+            if completed.returncode != 0:
+                return f"❌ git clone a échoué ({completed.returncode})\nSTDERR:\n{completed.stderr.strip()}"
+            return f"✅ Clone OK → {repo_name}\nSTDOUT:\n{completed.stdout.strip()}"
+
+        except subprocess.TimeoutExpired:
+            return "❌ Timeout git clone."
+        except Exception as e:
+            return f"❌ Erreur git_clone: {e}"
+
+    @staticmethod
+    def git_update(repo_name: str, strategy: str = "pull") -> str:
+        try:
+            p = Tools._paths()
+            safe = Tools._sanitize_repo_name(repo_name)
+            repo = os.path.join(p["repos"], safe)
+            if not os.path.isdir(repo):
+                return f"❌ Dépôt introuvable: {safe}"
+
+            _tmp = Tools()
+            timeout_s = max(30, int(_tmp.valves.git_timeout_s))
+
+            def run(cmd, cwd):
+                proc = subprocess.run(
+                    cmd,
+                    cwd=cwd,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout_s,
+                    check=False,
+                )
+                return proc.returncode, proc.stdout, proc.stderr
+
+            if strategy not in ("pull", "reset"):
+                strategy = "pull"
+
+            if strategy == "pull":
+                rc1, out1, err1 = run(["git", "fetch", "--all", "--tags"], repo)
+                rc2, out2, err2 = run(["git", "pull", "--ff-only"], repo)
+                if rc1 != 0 or rc2 != 0:
+                    return f"❌ git_update pull a échoué\nfetch rc={rc1} err={err1}\npull rc={rc2} err={err2}"
+                return f"✅ Pull OK\n{out1}\n{out2}".strip()
+
+            rc1, out1, err1 = run(["git", "fetch", "--all", "--tags"], repo)
+            rcH, outH, errH = run(
+                ["git", "symbolic-ref", "refs/remotes/origin/HEAD"], repo
+            )
+            ref = "origin/HEAD"
+            if rcH == 0:
+                ref = outH.strip().split("/")[-1]
+                ref = f"origin/{ref}" if ref else "origin/HEAD"
+            rc2, out2, err2 = run(["git", "reset", "--hard", ref], repo)
+
+            if rc1 != 0 or rc2 != 0:
+                return f"❌ git_update reset a échoué\nfetch rc={rc1} err={err1}\nreset rc={rc2} err={err2}"
+            return f"✅ Reset OK → {ref}\n{out1}\n{out2}".strip()
+
+        except subprocess.TimeoutExpired:
+            return "❌ Timeout git_update."
+        except Exception as e:
+            return f"❌ Erreur git_update: {e}"
+
+    # ------------------------------
+    # NEW — clean_analysis
+    # ------------------------------
+    @staticmethod
+    def clean_analysis(repo_name: str) -> str:
+        try:
+            p = Tools._paths()
+            safe = Tools._sanitize_repo_name(repo_name)
+            repo = os.path.join(p["repos"], safe)
+            analysis = os.path.join(repo, "docs_analysis")
+            if not os.path.isdir(repo):
+                return f"❌ Dépôt introuvable: {safe}"
+            if not os.path.isdir(analysis):
+                return f"ℹ️ Rien à nettoyer (pas de docs_analysis) pour {safe}"
+            for root, dirs, files in os.walk(analysis, topdown=False):
+                for f in files:
+                    try:
+                        os.remove(os.path.join(root, f))
+                    except Exception:
+                        pass
+                for d in dirs:
+                    try:
+                        os.rmdir(os.path.join(root, d))
+                    except Exception:
+                        pass
+            try:
+                os.rmdir(analysis)
+            except Exception:
+                pass
+            return f"✅ Nettoyage docs_analysis terminé pour {safe}"
+        except Exception as e:
+            return f"❌ Erreur clean_analysis: {e}"
+
+    # ------------------------------
+    # NEW — llm_check
+    # ------------------------------
+    @staticmethod
+    def llm_check(llm: str = "", model: str = "") -> str:
+        try:
+            t = Tools()
+            use = t._pick_llm(llm)
+            if not use:
+                return "❌ Aucun LLM CLI disponible (essayé: qwen, gemini)."
+            ok, diag = t._test_llm_cli(use)
+            m = model or t.user_valves.llm_model_name or "n/d"
+            return f"✅ LLM détecté: {use}\n- diag: {diag}\n- modèle par défaut: {m}"
+        except Exception as e:
+            return f"❌ Erreur llm_check: {e}"
+
+    # ------------------------------
+    # NEW — analyze_repo (LLM)
+    # ------------------------------
+    @staticmethod
+    def analyze_repo(
+        repo_name: str,
+        sections: str = "architecture,api,codemap",
+        depth: str = "",
+        language: str = "",
+        llm: str = "",
+        model: str = "",
     ) -> str:
         """
-        Injecte le contexte du dépôt via les citations Open WebUI
-        
-        Charge les fichiers de synthèse générés et les injecte
-        dans la conversation via le système de citations.
-        
-        Args:
-            repo_path (str): Chemin du dépôt
-            repo_info (Dict): Informations du dépôt
-            synthesis_files (List): Liste des fichiers de synthèse
-            __event_emitter__: Fonction d'émission d'événements
-            
-        Returns:
-            str: Résumé du contexte injecté
+        Génère docs_analysis/ via LLM CLI.
+        - repo_name: nom du dépôt (dossier dans git_repos)
+        - sections: liste csv dans {architecture, api, codemap}
+        - depth: quick|standard|deep (override)
+        - language: fr|en (override)
+        - llm: qwen|gemini|auto (override)
+        - model: nom de modèle (override)
         """
         try:
-            if not __event_emitter__:
-                return "Event emitter non disponible pour injection"
-            
-            analysis_dir = os.path.join(repo_path, "docs_analysis")
-            injected_files = 0
-            
-            # Injection des fichiers de synthèse
-            for filename in synthesis_files[:self.user_valves.max_context_files]:
-                file_path = os.path.join(analysis_dir, filename)
-                
-                if os.path.exists(file_path):
-                    try:
-                        async with aiofiles.open(file_path, 'r', encoding='utf-8') as f:
-                            content = await f.read()
-                        
-                        # Injection via citation
-                        await __event_emitter__({
-                            "type": "citation",
-                            "data": {
-                                "document": [content],
-                                "metadata": [{
-                                    "source": f"{repo_info['url_clean']}/{filename}",
-                                    "html": False
-                                }],
-                                "source": {
-                                    "name": f"{repo_info['owner']}/{repo_info['repo']} - {filename}"
-                                }
-                            }
-                        })
-                        
-                        injected_files += 1
-                        self.logger.debug(f"Contexte injecté: {filename}")
-                        
-                    except Exception as e:
-                        self.logger.error(f"Erreur injection {filename}: {e}")
-            
-            return f"Contexte injecté: {injected_files} fichiers de synthèse"
-            
-        except Exception as e:
-            self.logger.error(f"Erreur injection contexte: {e}")
-            return f"Erreur injection contexte: {str(e)}"
+            p = Tools._paths()
+            safe = Tools._sanitize_repo_name(repo_name)
+            repo_dir = os.path.join(p["repos"], safe)
+            if not os.path.isdir(repo_dir):
+                return f"❌ Dépôt introuvable: {safe}"
 
-    async def _get_repo_metadata(self, repo_path: str) -> Dict[str, Any]:
-        """
-        Récupère les métadonnées d'un dépôt analysé
-        
-        Args:
-            repo_path (str): Chemin du dépôt
-            
-        Returns:
-            Dict avec les métadonnées ou valeurs par défaut
-        """
-        try:
-            metadata_path = os.path.join(repo_path, "docs_analysis", "analysis_metadata.json")
-            
-            if os.path.exists(metadata_path):
-                async with aiofiles.open(metadata_path, 'r', encoding='utf-8') as f:
-                    content = await f.read()
-                    metadata = json.loads(content)
-                    llm_info = metadata.get("llm", {})
-                    llm_used = (
-                        f"{llm_info.get('cli_name', 'Inconnue')} ({llm_info.get('model', '')})"
-                        if llm_info
-                        else "Inconnue"
-                    )
-                    files = metadata.get("files", [])
-                    total_size = sum(f.get("size", 0) for f in files)
-                    return {
-                        "last_analysis": metadata.get("analysis_timestamp", "Inconnue"),
-                        "llm_used": llm_used,
-                        "synthesis_count": metadata.get("synthesis_count", 0),
-                        "file_count": len(files),
-                        "total_size_mb": round(total_size / (1024 * 1024), 1),
-                    }
-            else:
-                return {
-                    "last_analysis": "Métadonnées non disponibles",
-                    "llm_used": "Inconnue",
-                    "synthesis_count": 0,
-                    "file_count": "N/A",
-                    "total_size_mb": "N/A"
-                }
-                
-        except Exception as e:
-            self.logger.error(f"Erreur lecture métadonnées {repo_path}: {e}")
-            return {
-                "last_analysis": f"Erreur: {str(e)}",
-                "llm_used": "Erreur",
-                "synthesis_count": 0,
-                "file_count": "N/A",
-                "total_size_mb": "N/A"
+            tool = Tools()
+            use_llm = tool._pick_llm(llm)
+            if not use_llm:
+                return (
+                    "❌ Aucun LLM CLI disponible (qwen/gemini). Utilisez llm_check()."
+                )
+            use_model = (model or tool.user_valves.llm_model_name).strip()
+            lang = (language or tool.user_valves.preferred_language or "fr").lower()
+            if lang not in ("fr", "en"):
+                lang = "fr"
+
+            # Préparer contexte
+            ctx = tool._prepare_code_context(
+                repo_dir, depth or tool.user_valves.analysis_depth
+            )
+            if not ctx:
+                return f"❌ Contexte vide pour {safe}"
+
+            # Prompts
+            style = tool.user_valves.prompt_style
+            extra_arch = tool.user_valves.prompt_extra_architecture or ""
+            extra_api = tool.user_valves.prompt_extra_api or ""
+            extra_map = tool.user_valves.prompt_extra_codemap or ""
+
+            prompts = {
+                "architecture": {
+                    "fr": f"Analyse l'architecture: stack, modules clés, points d'entrée, organisation, patterns. Style: {style}. {extra_arch}".strip(),
+                    "en": f"Analyze architecture: stack, key modules, entry points, organization, patterns. Style: {style}. {extra_arch}".strip(),
+                },
+                "api": {
+                    "fr": f"Extrait les APIs: classes/fonctions publiques, interfaces, points d'entrée programmatiques. Style: {style}. {extra_api}".strip(),
+                    "en": f"Extract APIs: public classes/functions, interfaces, programmatic entry points. Style: {style}. {extra_api}".strip(),
+                },
+                "codemap": {
+                    "fr": f"Carte du code: rôle des dossiers, fichiers importants, principaux flux de données, navigation efficace. Style: {style}. {extra_map}".strip(),
+                    "en": f"Code map: role of folders, key files, main data flows, navigation guidance. Style: {style}. {extra_map}".strip(),
+                },
             }
+
+            wanted = []
+            for s in [s.strip().lower() for s in sections.split(",") if s.strip()]:
+                if s in ("architecture", "api", "codemap"):
+                    wanted.append(s)
+            if not wanted:
+                wanted = ["architecture", "api", "codemap"]
+
+            analysis_dir = os.path.join(repo_dir, "docs_analysis")
+            os.makedirs(analysis_dir, exist_ok=True)
+
+            generated = 0
+            results_lines = [
+                f"## Analyse LLM — dépôt: {safe}",
+                f"- LLM: {use_llm} | modèle: {use_model}",
+                f"- sections: {', '.join(wanted)}",
+                f"- langue: {lang}",
+                "",
+            ]
+
+            for sec in wanted:
+                prompt = prompts[sec][lang]
+                rc, out, err, dur = tool._execute_llm_cli(
+                    use_llm, use_model, prompt, ctx
+                )
+                tool.logger.info(
+                    "[LLM] section=%s rc=%s dur=%.1fs err=%s",
+                    sec,
+                    rc,
+                    dur,
+                    (err.strip()[:200] if err else ""),
+                )
+
+                if rc != 0:
+                    results_lines.append(
+                        f"❌ {sec.upper()} — échec rc={rc} ({dur:.1f}s)\n{(err or '').strip()[:500]}"
+                    )
+                    continue
+
+                fname = {
+                    "architecture": "ARCHITECTURE.md",
+                    "api": "API_SUMMARY.md",
+                    "codemap": "CODE_MAP.md",
+                }[sec]
+                fpath = os.path.join(analysis_dir, fname)
+                try:
+                    with open(fpath, "w", encoding="utf-8") as f:
+                        f.write(out.strip() if out.strip() else "(vide)")
+                    generated += 1
+                    results_lines.append(
+                        f"✅ {sec.upper()} → {fname} ({len(out.encode('utf-8'))} bytes, {dur:.1f}s)"
+                    )
+                except Exception as e:
+                    results_lines.append(f"❌ {sec.upper()} — écriture échouée: {e}")
+
+            # metadata
+            metadata = {
+                "repo_info": {"name": safe, "path": repo_dir},
+                "analysis_timestamp": datetime.now().isoformat(),
+                "llm_cli_used": use_llm,
+                "synthesis_count": generated,
+                "user_config": {
+                    "analysis_depth": depth or tool.user_valves.analysis_depth,
+                    "preferred_language": lang,
+                    "prompt_style": style,
+                },
+                "tool_version": "1.6.0",
+            }
+            try:
+                with open(
+                    os.path.join(analysis_dir, "analysis_metadata.json"),
+                    "w",
+                    encoding="utf-8",
+                ) as f:
+                    json.dump(metadata, f, indent=2, ensure_ascii=False)
+            except Exception as e:
+                results_lines.append(f"⚠️ Écriture metadata échouée: {e}")
+
+            if generated == 0:
+                results_lines.append(
+                    "\nAucun fichier généré. Consultez les logs pour le détail."
+                )
+            else:
+                results_lines.append(
+                    f"\nSynthèses générées: {generated} — dossier: {analysis_dir}"
+                )
+
+            return "\n".join(results_lines)
+
+        except Exception as e:
+            return f"❌ Erreur analyze_repo: {e}"
+
